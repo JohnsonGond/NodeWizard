@@ -1,0 +1,19 @@
+# Credentials & Sensitive Files
+*.json
+warp_and_ss_credentials.json
+*.key
+*.pem
+
+# Backups & Logs
+DEV_*.md
+*.local.*
+node-deploy.sh
+vps-box.sh
+*.bak*
+*.log
+*.tmp
+*.lock
+
+# OS & Environment
+.DS_Store
+Thumbs.db
