@@ -511,11 +511,11 @@ proxies:
     dialer-proxy: "机场-低延迟节点名称"   # <-- 替换为您已有中转/机场订阅中的节点名称
 EOF
 
-    echo -e "\n${BOLD}${BLUE}【2. Shadowrocket / 通用一键导入链接】${NC}"
+    echo -e "\n${BOLD}${BLUE}【2. Sub-Store / Shadowrocket / 通用一键导入链接 (含后量子参数)】${NC}"
     echo -e "* 直连模式："
-    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
+    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&support-x25519mlkem768=true&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
     echo -e "* 链式中继落地模式："
-    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
+    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&support-x25519mlkem768=true&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
 
     echo ""
     echo "=========================================================================="
@@ -1713,11 +1713,11 @@ proxies:
     dialer-proxy: "机场-低延迟节点名称"   # <-- 替换为您已有中转/机场订阅中的节点名称
 EOF
 
-    echo -e "\n${BOLD}${BLUE}【2. Shadowrocket / 通用一键导入链接】${NC}"
+    echo -e "\n${BOLD}${BLUE}【2. Sub-Store / Shadowrocket / 通用一键导入链接 (含后量子参数)】${NC}"
     echo -e "* 直连模式："
-    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_dir}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
+    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_dir}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&support-x25519mlkem768=true&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
     echo -e "* 链式中继落地模式："
-    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_rly}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
+    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_rly}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&support-x25519mlkem768=true&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
 
     echo -e "\n=========================================================================="
     echo -e "                   ${BOLD}${RED}⚠️  新机上线后必做的 3 项外部核验 ⚠️${NC}"
