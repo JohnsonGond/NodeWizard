@@ -1149,11 +1149,15 @@ setup_xray_and_warp() {
         cur_sys_v6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
         if [[ "$cur_sys_v6" == "1" ]]; then
             IPV6_STRATEGY="1"
+        elif [[ -z "${NODE_IPV6:-}" ]]; then
+            IPV6_STRATEGY="2"
         elif [[ -f /usr/local/etc/xray/config.json ]]; then
             if grep -q '"ip": \["\:\:\/0"\]' /usr/local/etc/xray/config.json 2>/dev/null && grep -A 2 '"ip": \["\:\:\/0"\]' /usr/local/etc/xray/config.json | grep -q '"outboundTag": "block"'; then
                 IPV6_STRATEGY="2"
             elif grep -q '"ip": \["\:\:\/0"\]' /usr/local/etc/xray/config.json 2>/dev/null && grep -A 2 '"ip": \["\:\:\/0"\]' /usr/local/etc/xray/config.json | grep -q '"outboundTag": "warp"'; then
                 IPV6_STRATEGY="3"
+            elif grep -q '"UseIPv4"' /usr/local/etc/xray/config.json 2>/dev/null; then
+                IPV6_STRATEGY="2"
             else
                 IPV6_STRATEGY="4"
             fi
