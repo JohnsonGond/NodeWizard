@@ -39,6 +39,29 @@ msg_err()  { echo -e "${RED}[ERR ]${NC} $*"; }
 msg_step() { echo -e "\n${BOLD}${BLUE}==>${NC} ${BOLD}$*${NC}"; }
 
 DEFAULT_SAFE_USER="safeuser"
+SCRIPT_URL="https://raw.githubusercontent.com/JohnsonGond/NodeWizard/main/nodewizard.sh"
+SHORT_URL="https://nw.531555.xyz"
+INSTALL_PATH="/usr/local/bin/nw"
+ALIAS_PATH="/usr/local/bin/nodewiz"
+
+# 全局状态变量初始化 (防 set -u 未定义报错)
+MAINT_USER=""
+TARGET_SSH_PORT=""
+OLD_SSH_PORT=""
+IPV6_STRATEGY="1"
+REALITY_TARGET=""
+REALITY_SNI=""
+VLESS_UUID=""
+REALITY_PRIV_KEY=""
+REALITY_PUB_KEY=""
+REALITY_SHORT_ID=""
+SERVER_IP="127.0.0.1"
+NODE_IPV6=""
+NODE_CC="US"
+NODE_COUNTRY="United States"
+NODE_CITY="Los Angeles"
+NODE_ISP="Cloud Provider"
+NODE_FLAG="🇺🇸"
 
 # ── 1. 终端横幅 ─────────────────────────────────────────────────────────────
 print_banner() {
@@ -53,12 +76,59 @@ print_banner() {
 BANNER
     echo -e "${NC}"
     echo -e "  ${BOLD}${MAGENTA}🧙‍♂️ Cloud Infrastructure Node Provisioning Wizard (NodeWizard)${NC}"
-    echo -e "  ${CYAN}工业级基座加固 · 动态地理感知 · Xray+WARP 深度路由 · 社区工具无缝解耦${NC}"
+    echo -e "  ${CYAN}工业级基座加固 · 动态地理感知 · Xray+WARP 深度路由 · 快捷命令: ${BOLD}${GREEN}nw${NC}${CYAN} / ${BOLD}${GREEN}nodewiz${NC}"
     echo "=========================================================================="
     echo ""
 }
 
-# ── 2. 运行权限校验与自动提权 ───────────────────────────────────────────────
+# ── 2. 运行权限校验、快捷命令安装与自动更新 ─────────────────────────────────
+ensure_shortcut_installed() {
+    # 如果当前是从本地有效脚本文件启动，直接同步到 /usr/local/bin/nw
+    if [[ -f "$0" && "$0" != "$INSTALL_PATH" && "$0" != "$ALIAS_PATH" ]] && grep -q "NodeWizard" "$0" 2>/dev/null; then
+        cp -f "$0" "$INSTALL_PATH" 2>/dev/null || true
+        chmod +x "$INSTALL_PATH" 2>/dev/null || true
+        ln -sf "$INSTALL_PATH" "$ALIAS_PATH" 2>/dev/null || true
+    elif [[ ! -f "$INSTALL_PATH" ]]; then
+        # 如果是通过 curl | bash 或 bash -c "$(curl ...)" 启动且本地尚未固化 nw
+        if command -v curl >/dev/null 2>&1; then
+            local tmp_dl="/tmp/nodewizard_init_$$.sh"
+            if curl -fsSL --max-time 10 "$SHORT_URL" -o "$tmp_dl" 2>/dev/null || curl -fsSL --max-time 10 "$SCRIPT_URL" -o "$tmp_dl" 2>/dev/null; then
+                if grep -q "NodeWizard" "$tmp_dl" 2>/dev/null; then
+                    mv -f "$tmp_dl" "$INSTALL_PATH"
+                    chmod +x "$INSTALL_PATH"
+                    ln -sf "$INSTALL_PATH" "$ALIAS_PATH" 2>/dev/null || true
+                fi
+            fi
+            rm -f "$tmp_dl" 2>/dev/null || true
+        fi
+    fi
+}
+
+update_script() {
+    msg_step "【在线更新】正在从云端同步最新版本的 NodeWizard ..."
+    local tmp_up="/tmp/nodewizard_update_$$.sh"
+    if curl -fsSL --max-time 15 "$SHORT_URL" -o "$tmp_up" 2>/dev/null || curl -fsSL --max-time 15 "$SCRIPT_URL" -o "$tmp_up" 2>/dev/null; then
+        if bash -n "$tmp_up" 2>/dev/null && grep -q "NodeWizard" "$tmp_up" 2>/dev/null; then
+            mv -f "$tmp_up" "$INSTALL_PATH"
+            chmod +x "$INSTALL_PATH"
+            ln -sf "$INSTALL_PATH" "$ALIAS_PATH" 2>/dev/null || true
+            # 若当前目录下存在同源 nodewizard.sh (且非 git 工作区未提交状态)，同步更新
+            if [[ -f "./nodewizard.sh" && ! -d "./.git" ]]; then
+                cp -f "$INSTALL_PATH" "./nodewizard.sh" 2>/dev/null || true
+            fi
+            msg_ok "NodeWizard 已成功更新至最新版本！(快捷命令: nw / nodewiz)"
+            sleep 1
+            exec "$INSTALL_PATH"
+        else
+            rm -f "$tmp_up" 2>/dev/null || true
+            msg_err "下载的脚本未通过语法完整性校验，已中止更新。"
+        fi
+    else
+        rm -f "$tmp_up" 2>/dev/null || true
+        msg_err "无法连接更新源 ($SHORT_URL)，请检查网络后重试。"
+    fi
+}
+
 check_environment() {
     if [[ $EUID -ne 0 ]]; then
         if command -v sudo >/dev/null 2>&1; then
@@ -68,6 +138,11 @@ check_environment() {
             msg_err "NodeWizard 必须以 root 权限运行，且当前环境未检测到 sudo 命令！请切换至 root 后重试。"
             exit 1
         fi
+    fi
+
+    # 修复 curl ... | bash 管道模式下标准输入被抢占导致 read 跳过的问题
+    if [[ ! -t 0 && -e /dev/tty ]]; then
+        exec < /dev/tty
     fi
 
     if [[ -f /etc/os-release ]]; then
@@ -84,23 +159,42 @@ check_environment() {
         read -rp "是否仍要继续？[y/N]: " confirm
         [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
     fi
+
+    ensure_shortcut_installed
 }
 
-# ── 3. 动态地理与 IP 探测 ───────────────────────────────────────────────────
+# ── 3. 动态地理与 IP 探测 (免 jq 依赖，兼容纯净裸机首次启动) ─────────────────
+extract_json_str() {
+    local json="$1"
+    local key="$2"
+    if command -v jq >/dev/null 2>&1; then
+        echo "$json" | jq -r ".${key} // empty" 2>/dev/null
+    else
+        echo "$json" | grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -n1 | sed -E 's/^"[^"]*"[[:space:]]*:[[:space:]]*"([^"]*)"$/\1/'
+    fi
+}
+
 detect_node_geo() {
+    if ! command -v curl >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || true
+    fi
+
     SERVER_IP=$(curl -s4 --max-time 4 https://api.ipify.org || curl -s4 --max-time 4 https://ifconfig.me || echo "127.0.0.1")
 
     # 检测是否有全局公网 IPv6
     NODE_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | head -n1 | cut -d'/' -f1 || echo "")
 
-    local geo_json
+    local geo_json status
     geo_json=$(curl -s4 --max-time 4 "http://ip-api.com/json/${SERVER_IP}?fields=status,country,countryCode,city,isp,query" 2>/dev/null || echo "{}")
+    status=$(extract_json_str "$geo_json" "status")
 
-    if [[ "$(echo "$geo_json" | jq -r '.status // empty' 2>/dev/null)" == "success" ]]; then
-        NODE_CC=$(echo "$geo_json" | jq -r '.countryCode' | tr '[:lower:]' '[:upper:]')
-        NODE_COUNTRY=$(echo "$geo_json" | jq -r '.country')
-        NODE_CITY=$(echo "$geo_json" | jq -r '.city')
-        NODE_ISP=$(echo "$geo_json" | jq -r '.isp')
+    if [[ "$status" == "success" ]]; then
+        NODE_CC=$(extract_json_str "$geo_json" "countryCode" | tr '[:lower:]' '[:upper:]')
+        NODE_COUNTRY=$(extract_json_str "$geo_json" "country")
+        NODE_CITY=$(extract_json_str "$geo_json" "city")
+        NODE_ISP=$(extract_json_str "$geo_json" "isp")
     else
         NODE_CC="US"
         NODE_COUNTRY="United States"
@@ -120,6 +214,7 @@ detect_node_geo() {
         FR) NODE_FLAG="🇫🇷" ;;
         CA) NODE_FLAG="🇨🇦" ;;
         AU) NODE_FLAG="🇦🇺" ;;
+        NL) NODE_FLAG="🇳🇱" ;;
         *)  NODE_FLAG="🌐" ;;
     esac
 }
@@ -139,13 +234,14 @@ get_random_high_port() {
 # ── 5. 辅助函数: 获取当前实际 SSH 端口 ───────────────────────────────────────
 get_current_ssh_port() {
     local current_port=22
+    local p=""
     if ss -tlnp 2>/dev/null | grep -E 'sshd|ssh' >/dev/null 2>&1; then
-        current_port=$(ss -tlnp 2>/dev/null | grep -E 'sshd|ssh' | awk '{print $4}' | awk -F':' '{print $NF}' | head -n1)
-    elif [[ -f /etc/ssh/sshd_config ]]; then
-        local p
-        p=$(grep -E "^[# ]*Port [0-9]+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1)
-        [[ -n "$p" ]] && current_port=$p
+        p=$(ss -tlnp 2>/dev/null | grep -E 'sshd|ssh' | awk '{print $4}' | awk -F':' '{print $NF}' | grep -E '^[0-9]+$' | head -n1 || echo "")
     fi
+    if [[ -z "$p" ]]; then
+        p=$(grep -RhE "^[[:space:]]*Port[[:space:]]+[0-9]+" /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | awk '{print $2}' | head -n1 || echo "")
+    fi
+    [[ -n "$p" ]] && current_port="$p"
     echo "$current_port"
 }
 
@@ -179,7 +275,7 @@ audit_node_status() {
     fi
     echo -e "  物理归属地        : ${BOLD}${NODE_FLAG} ${NODE_COUNTRY} - ${NODE_CITY}${NC} (${NODE_ISP})"
     local current_dns
-    current_dns=$(grep -E '^nameserver ' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ' || echo "未知")
+    current_dns=$(grep -E '^nameserver ' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | awk '!seen[$0]++' | tr '\n' ' ' || echo "未知")
     echo -e "  系统 DNS 服务器   : ${current_dns}"
 
     # 2. 账户与 SSH 状态
@@ -199,15 +295,15 @@ audit_node_status() {
         echo -e "  当前 SSH 监听端口  : ${BOLD}${YELLOW}${current_ssh_port}${NC} [非高位端口 (<=30000)，易遭爆破]"
     fi
 
-    local root_login="允许 (未加固)"
-    if grep -E "^[[:space:]]*PermitRootLogin[[:space:]]+no" /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* 2>/dev/null | grep -q "no"; then
-        root_login="${GREEN}已禁用 (安全)${NC}"
+    local root_login="${YELLOW}允许 (未加固)${NC}"
+    if grep -RhE "^[[:space:]]*PermitRootLogin[[:space:]]+no" /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | grep -qi "no"; then
+        root_login="${BOLD}${GREEN}已禁用 (安全)${NC}"
     fi
     echo -e "  Root 直接密码登录 : ${root_login}"
 
-    local pwd_auth="允许 (未加固)"
-    if grep -E "^[[:space:]]*PasswordAuthentication[[:space:]]+no" /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* 2>/dev/null | grep -q "no"; then
-        pwd_auth="${GREEN}已禁用/仅限密钥 (安全)${NC}"
+    local pwd_auth="${YELLOW}允许 (未加固)${NC}"
+    if grep -RhE "^[[:space:]]*PasswordAuthentication[[:space:]]+no" /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | grep -qi "no"; then
+        pwd_auth="${BOLD}${GREEN}已禁用/仅限密钥 (安全)${NC}"
     fi
     echo -e "  密码认证登录      : ${pwd_auth}"
 
@@ -216,7 +312,7 @@ audit_node_status() {
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then
         echo -e "  UFW 防火墙状态    : ${BOLD}${GREEN}运行中 (Active)${NC}"
         local ufw_ports
-        ufw_ports=$(ufw status 2>/dev/null | grep -E 'ALLOW' | awk '{print $1}' | tr '\n' ' ' || echo "无")
+        ufw_ports=$(ufw status 2>/dev/null | grep -E 'ALLOW' | awk '{print $1}' | awk '!seen[$0]++' | tr '\n' ' ' || echo "无")
         echo -e "  UFW 已放行规则    : ${ufw_ports}"
     else
         echo -e "  UFW 防火墙状态    : ${YELLOW}未启用或未安装${NC}"
@@ -309,7 +405,9 @@ audit_node_status() {
 
     echo ""
     echo "=========================================================================="
-    read -rp "巡检完成。按回车键返回主菜单..." _
+    if [[ "${1:-}" != "cli" ]]; then
+        read -rp "巡检完成。按回车键返回主菜单..." _
+    fi
 }
 
 # ── 8. 查看当前客户端节点配置与订阅链接 (菜单选项 [5]) ─────────────────────────
@@ -317,7 +415,9 @@ view_client_configs() {
     print_banner
     if ! systemctl is-active xray >/dev/null 2>&1 || [[ ! -f /usr/local/etc/xray/config.json ]]; then
         msg_err "当前节点尚未安装或运行 Xray 核心，无法生成客户端链接。请先选择 [1] 或 [4] 进行部署。"
-        read -rp "按回车键返回主菜单..." _
+        if [[ "${1:-}" != "cli" ]]; then
+            read -rp "按回车键返回主菜单..." _
+        fi
         return
     fi
 
@@ -334,10 +434,11 @@ view_client_configs() {
     short_id=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$cfg" 2>/dev/null)
 
     if [[ -n "$priv_key" ]]; then
-        pub_key=$(xray x25519 -i "$priv_key" 2>/dev/null | grep 'Password' | awk '{print $3}' || echo "")
+        pub_key=$(xray x25519 -i "$priv_key" 2>/dev/null | grep -iE 'Password|Public' | awk '{print $NF}' || echo "")
     fi
 
     local default_node_title="${NODE_FLAG} ${NODE_CITY} 落地"
+    local encoded_city="${NODE_CITY// /%20}"
 
     echo ""
     echo "=========================================================================="
@@ -394,13 +495,15 @@ EOF
 
     echo -e "\n${BOLD}${BLUE}【2. Shadowrocket / 通用一键导入链接】${NC}"
     echo -e "* 直连模式："
-    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp&headerType=none#${NODE_FLAG}%20${NODE_CITY}%E7%9B%B4%E8%BF%9E${NC}"
+    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
     echo -e "* 链式中继落地模式："
-    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp&headerType=none#${NODE_FLAG}%20${NODE_CITY}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
+    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
 
     echo ""
     echo "=========================================================================="
-    read -rp "提取完成。按回车键返回主菜单..." _
+    if [[ "${1:-}" != "cli" ]]; then
+        read -rp "提取完成。按回车键返回主菜单..." _
+    fi
 }
 
 # ── 9. IPv6 专属出站治理管理子菜单 (菜单选项 [6]) ─────────────────────────────
@@ -448,6 +551,10 @@ net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
                 sysctl --system >/dev/null 2>&1 || true
+                IPV6_STRATEGY="1"
+                if [[ -f /usr/local/etc/xray/config.json ]]; then
+                    setup_xray_and_warp "silent"
+                fi
                 msg_ok "系统内核级 IPv6 协议栈已彻底关闭！测试网站绝无泄露可能。"
                 sleep 2
                 ;;
@@ -458,9 +565,9 @@ EOF
                 sysctl --system >/dev/null 2>&1 || true
 
                 # 修改 Xray 配置为出站阻断 ::/0
-                IPV6_STRATEGY="1"
+                IPV6_STRATEGY="2"
                 if [[ -f /usr/local/etc/xray/config.json ]]; then
-                    setup_xray_and_warp
+                    setup_xray_and_warp "silent"
                 fi
                 msg_ok "代理层 IPv6 出站阻断策略配置生效！"
                 sleep 2
@@ -471,9 +578,9 @@ EOF
                 sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
                 sysctl --system >/dev/null 2>&1 || true
 
-                IPV6_STRATEGY="2"
+                IPV6_STRATEGY="3"
                 if [[ -f /usr/local/etc/xray/config.json ]]; then
-                    setup_xray_and_warp
+                    setup_xray_and_warp "silent"
                 fi
                 msg_ok "IPv6 走 WARP 出站策略配置生效！"
                 sleep 2
@@ -488,7 +595,7 @@ EOF
                 # 2. 恢复 Xray 原生直连 (移除 ::/0 规则，DNS 恢复 UseIP)
                 IPV6_STRATEGY="4"
                 if [[ -f /usr/local/etc/xray/config.json ]]; then
-                    setup_xray_and_warp
+                    setup_xray_and_warp "silent"
                 fi
                 msg_ok "已全面恢复正常双栈连接！原生 IPv6 出入站已全面解锁。"
                 sleep 2
@@ -724,7 +831,8 @@ setup_user_and_ssh() {
 
     msg_info "应用高安全级别 SSH 策略 (端口: ${TARGET_SSH_PORT}, 仅密钥登录, 禁用密码与 Root)..."
     local ssh_conf="/etc/ssh/sshd_config"
-    cp "$ssh_conf" "${ssh_conf}.bak_$(date +%Y%m%d%H%M%S)"
+    local ssh_bak="${ssh_conf}.bak_$(date +%Y%m%d%H%M%S)"
+    cp "$ssh_conf" "$ssh_bak"
 
     sed -i -E "s/^[# ]*Port [0-9]+/Port ${TARGET_SSH_PORT}/" "$ssh_conf"
     grep -q "^Port ${TARGET_SSH_PORT}" "$ssh_conf" || echo "Port ${TARGET_SSH_PORT}" >> "$ssh_conf"
@@ -741,6 +849,15 @@ setup_user_and_ssh() {
     sed -i -E 's/^[# ]*KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' "$ssh_conf"
     grep -q "^KbdInteractiveAuthentication no" "$ssh_conf" || echo "KbdInteractiveAuthentication no" >> "$ssh_conf"
 
+    # 清理 /etc/ssh/sshd_config.d/*.conf 中的云厂商默认覆盖项 (如 50-cloud-init.conf 强制开启密码登录)
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        for subconf in /etc/ssh/sshd_config.d/*.conf; do
+            [[ -f "$subconf" ]] || continue
+            sed -i -E 's/^[[:space:]]*PasswordAuthentication[[:space:]]+yes/PasswordAuthentication no/I' "$subconf"
+            sed -i -E 's/^[[:space:]]*PermitRootLogin[[:space:]]+.*/PermitRootLogin no/I' "$subconf"
+        done
+    fi
+
     # 防火墙先开孔，绝对防锁死
     if command -v ufw >/dev/null 2>&1; then
         ufw allow "${TARGET_SSH_PORT}/tcp" comment 'SSH Port' >/dev/null 2>&1 || true
@@ -752,7 +869,8 @@ setup_user_and_ssh() {
         systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
         msg_ok "SSH 服务已在端口生效: ${BOLD}${GREEN}${TARGET_SSH_PORT}${NC} (运维用户: ${MAINT_USER})"
     else
-        msg_err "sshd 配置校验未通过！已自动恢复原有配置，请检查 ${ssh_conf}。"
+        cp -f "$ssh_bak" "$ssh_conf"
+        msg_err "sshd 配置校验未通过！已自动恢复原有配置 (${ssh_bak})，请检查 ${ssh_conf}。"
     fi
 }
 
@@ -815,6 +933,8 @@ setup_system_base_and_tcpfit() {
 
     # 2. 原生 BBR + FQ 保底生效 (0.5秒即时生效)
     msg_info "启用内核原生 BBR + FQ 拥塞控制基线..."
+    modprobe tcp_bbr 2>/dev/null || true
+    modprobe sch_fq 2>/dev/null || true
     cat <<EOF > /etc/sysctl.d/99-bbr-baseline.conf
 vm.swappiness = 10
 net.core.default_qdisc = fq
@@ -894,6 +1014,7 @@ EOF
                 msg_ok "选定策略: 【IPv6 走 WARP 兜底出站】(对外展示 Cloudflare IPv6)"
                 ;;
             *)
+                IPV6_STRATEGY="4"
                 rm -f /etc/sysctl.d/99-disable-ipv6.conf
                 sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
                 sysctl --system >/dev/null 2>&1 || true
@@ -938,17 +1059,36 @@ select_reality_target() {
     read -rp "请选择伪装源站 [0-4] (直接回车默认 [1] ${default_target}): " target_choice
     target_choice=${target_choice:-1}
 
-    case "$target_choice" in
-        1) REALITY_TARGET="$default_target" ;;
-        2) REALITY_TARGET="addons.mozilla.org:443" ;;
-        3) REALITY_TARGET="download.docker.com:443" ;;
-        4) REALITY_TARGET="images.unsplash.com:443" ;;
-        0)
-            read -rp "请输入自定义伪装源站 (域名:443): " custom_target
-            REALITY_TARGET="$custom_target"
-            ;;
-        *) REALITY_TARGET="$default_target" ;;
-    esac
+    if [[ "$NODE_CC" == "JP" ]]; then
+        case "$target_choice" in
+            1) REALITY_TARGET="$default_target" ;;
+            2) REALITY_TARGET="www.popsci.com:443" ;;
+            3) REALITY_TARGET="addons.mozilla.org:443" ;;
+            4) REALITY_TARGET="download.docker.com:443" ;;
+            0)
+                read -rp "请输入自定义伪装源站 (域名:443): " custom_target
+                REALITY_TARGET="${custom_target:-$default_target}"
+                ;;
+            *) REALITY_TARGET="$default_target" ;;
+        esac
+    else
+        case "$target_choice" in
+            1) REALITY_TARGET="$default_target" ;;
+            2) REALITY_TARGET="addons.mozilla.org:443" ;;
+            3) REALITY_TARGET="download.docker.com:443" ;;
+            4) REALITY_TARGET="images.unsplash.com:443" ;;
+            0)
+                read -rp "请输入自定义伪装源站 (域名:443): " custom_target
+                REALITY_TARGET="${custom_target:-$default_target}"
+                ;;
+            *) REALITY_TARGET="$default_target" ;;
+        esac
+    fi
+
+    # 若用户只输入了域名未带 :端口，自动补全 :443
+    if [[ "$REALITY_TARGET" != *:* ]]; then
+        REALITY_TARGET="${REALITY_TARGET}:443"
+    fi
 
     REALITY_SNI=$(echo "$REALITY_TARGET" | cut -d':' -f1)
     msg_ok "选定 Reality Target: ${BOLD}${GREEN}${REALITY_TARGET}${NC} (SNI: ${REALITY_SNI})"
@@ -956,14 +1096,34 @@ select_reality_target() {
 
 # ── 16. Xray 原生部署、WARP 兜底与深度分流矩阵 ─────────────────────────────────
 setup_xray_and_warp() {
-    msg_step "【Step 7/7】部署 Xray 原生核心、WARP 兜底与独家深度路由矩阵"
+    local run_mode="${1:-interactive}"
+    if [[ "$run_mode" != "silent" ]]; then
+        msg_step "【Step 7/7】部署 Xray 原生核心、WARP 兜底与独家深度路由矩阵"
+    fi
+
+    # 0. 确保 REALITY_TARGET 与 REALITY_SNI 已定义 (防从子菜单 [6] 直接调用时为空)
+    if [[ -z "${REALITY_TARGET:-}" ]]; then
+        if [[ -f /usr/local/etc/xray/config.json ]]; then
+            REALITY_TARGET=$(jq -r '.inbounds[0].streamSettings.realitySettings.target // empty' /usr/local/etc/xray/config.json 2>/dev/null)
+        fi
+        if [[ -z "${REALITY_TARGET:-}" ]]; then
+            if [[ "${NODE_CC:-US}" == "JP" ]]; then
+                REALITY_TARGET="www.yahoo.co.jp:443"
+            else
+                REALITY_TARGET="www.popsci.com:443"
+            fi
+        fi
+    fi
+    if [[ -z "${REALITY_SNI:-}" ]]; then
+        REALITY_SNI=$(echo "$REALITY_TARGET" | cut -d':' -f1)
+    fi
 
     # 1. 安装 Xray 官方最新核心
     if ! command -v xray >/dev/null 2>&1; then
         msg_info "正在通过官方安装脚本部署最新 Xray-core..."
         bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
     fi
-    msg_ok "Xray 核心已就绪 ($(xray version | head -n1 | awk '{print $2}'))"
+    [[ "$run_mode" != "silent" ]] && msg_ok "Xray 核心已就绪 ($(xray version | head -n1 | awk '{print $2}'))"
 
     # 2. nobody 降权与 Linux Capabilities 特权绑定
     mkdir -p /etc/systemd/system/xray.service.d
@@ -988,24 +1148,27 @@ EOF
         old_short=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' /usr/local/etc/xray/config.json 2>/dev/null)
 
         if [[ -n "$old_uuid" && -n "$old_priv" ]]; then
-            echo ""
-            msg_info "检测到系统已存在 Xray 生产配置 (UUID: ${old_uuid})"
-            read -rp "是否保留现有的 UUID 与 Reality 密钥凭据？[Y/n] (默认 Y，免去重新配置客户端): " keep_resp
-            keep_resp=${keep_resp:-Y}
+            local keep_resp="Y"
+            if [[ "$run_mode" != "silent" ]]; then
+                echo ""
+                msg_info "检测到系统已存在 Xray 生产配置 (UUID: ${old_uuid})"
+                read -rp "是否保留现有的 UUID 与 Reality 密钥凭据？[Y/n] (默认 Y，免去重新配置客户端): " keep_resp
+                keep_resp=${keep_resp:-Y}
+            fi
             if [[ "$keep_resp" =~ ^[Yy]$ ]]; then
                 reuse_creds=true
                 VLESS_UUID="$old_uuid"
                 REALITY_PRIV_KEY="$old_priv"
                 REALITY_SHORT_ID="$old_short"
-                REALITY_PUB_KEY=$(xray x25519 -i "$REALITY_PRIV_KEY" 2>/dev/null | grep 'Password' | awk '{print $3}' || echo "")
+                REALITY_PUB_KEY=$(xray x25519 -i "$REALITY_PRIV_KEY" 2>/dev/null | grep -iE 'Password|Public' | awk '{print $NF}' || echo "")
                 if [[ -z "$REALITY_PUB_KEY" ]]; then
                     msg_warn "未能从已有私钥推算公钥，重新生成 Reality 密钥对..."
                     local x25519_regen
                     x25519_regen=$(xray x25519)
-                    REALITY_PRIV_KEY=$(echo "$x25519_regen" | grep 'PrivateKey' | awk '{print $2}')
-                    REALITY_PUB_KEY=$(echo "$x25519_regen" | grep 'Password' | awk '{print $3}')
+                    REALITY_PRIV_KEY=$(echo "$x25519_regen" | grep -i 'Private' | awk '{print $NF}')
+                    REALITY_PUB_KEY=$(echo "$x25519_regen" | grep -iE 'Password|Public' | awk '{print $NF}')
                 fi
-                msg_ok "已成功复用现有 VLESS UUID 与 Reality 密钥对！"
+                [[ "$run_mode" != "silent" ]] && msg_ok "已成功复用现有 VLESS UUID 与 Reality 密钥对！"
             fi
         fi
     fi
@@ -1015,29 +1178,31 @@ EOF
         VLESS_UUID=$(xray uuid)
         local x25519_output
         x25519_output=$(xray x25519)
-        REALITY_PRIV_KEY=$(echo "$x25519_output" | grep 'PrivateKey' | awk '{print $2}')
-        REALITY_PUB_KEY=$(echo "$x25519_output" | grep 'Password' | awk '{print $3}')
+        REALITY_PRIV_KEY=$(echo "$x25519_output" | grep -i 'Private' | awk '{print $NF}')
+        REALITY_PUB_KEY=$(echo "$x25519_output" | grep -iE 'Password|Public' | awk '{print $NF}')
         REALITY_SHORT_ID=$(openssl rand -hex 8)
     fi
 
-    # 4. 注册 Cloudflare WARP 原生 WireGuard 出站
-    local warp_priv="" warp_v4="" warp_peer_pub="" warp_reserved="[0, 0, 0]"
+    # 4. 注册 Cloudflare WARP 原生 WireGuard 出站 (含 IPv4 & IPv6 双栈地址)
+    local warp_priv="" warp_v4="" warp_v6="" warp_peer_pub="" warp_reserved="[0, 0, 0]"
     local has_warp=false
 
     # 优先复用已有 WARP 凭据
     if [[ -f /usr/local/etc/xray/config.json ]] && grep -q '"tag": "warp"' /usr/local/etc/xray/config.json 2>/dev/null; then
-        local w_priv w_v4 w_peer w_res
+        local w_priv w_v4 w_v6 w_peer w_res
         w_priv=$(jq -r '.outbounds[] | select(.tag=="warp") | .settings.secretKey // empty' /usr/local/etc/xray/config.json 2>/dev/null)
         w_v4=$(jq -r '.outbounds[] | select(.tag=="warp") | .settings.address[0] // empty' /usr/local/etc/xray/config.json 2>/dev/null)
+        w_v6=$(jq -r '.outbounds[] | select(.tag=="warp") | .settings.address[1] // empty' /usr/local/etc/xray/config.json 2>/dev/null)
         w_peer=$(jq -r '.outbounds[] | select(.tag=="warp") | .settings.peers[0].publicKey // empty' /usr/local/etc/xray/config.json 2>/dev/null)
         w_res=$(jq -c '.outbounds[] | select(.tag=="warp") | .settings.reserved // empty' /usr/local/etc/xray/config.json 2>/dev/null)
         if [[ -n "$w_priv" && -n "$w_v4" ]]; then
             warp_priv="$w_priv"
             warp_v4="$w_v4"
+            warp_v6="$w_v6"
             warp_peer_pub="$w_peer"
             warp_reserved="${w_res:-[0, 0, 0]}"
             has_warp=true
-            msg_ok "成功复用现有 Cloudflare WARP 出站凭据 (IPv4: ${warp_v4})"
+            [[ "$run_mode" != "silent" ]] && msg_ok "成功复用现有 Cloudflare WARP 出站凭据 (IPv4: ${warp_v4})"
         fi
     fi
 
@@ -1078,11 +1243,14 @@ try:
         reserved = list(base64.b64decode(cid)) if cid else [0, 0, 0]
         peer = cfg['peers'][0]
         v4_addr = cfg['interface']['addresses']['v4'] + '/32'
+        v6_raw = cfg['interface']['addresses'].get('v6', '')
+        v6_addr = (v6_raw + '/128') if v6_raw else ''
 
         with open('/tmp/warp_creds.json', 'w') as f:
             json.dump({
                 'priv_key': priv_key,
                 'v4_addr': v4_addr,
+                'v6_addr': v6_addr,
                 'peer_pub': peer['public_key'],
                 'reserved': reserved
             }, f)
@@ -1093,6 +1261,7 @@ except Exception as e:
         if [[ -f /tmp/warp_creds.json ]] && ! grep -q '"failed"' /tmp/warp_creds.json; then
             warp_priv=$(jq -r '.priv_key' /tmp/warp_creds.json)
             warp_v4=$(jq -r '.v4_addr' /tmp/warp_creds.json)
+            warp_v6=$(jq -r '.v6_addr // empty' /tmp/warp_creds.json)
             warp_peer_pub=$(jq -r '.peer_pub' /tmp/warp_creds.json)
             warp_reserved=$(jq -c '.reserved' /tmp/warp_creds.json)
             has_warp=true
@@ -1104,13 +1273,15 @@ except Exception as e:
         fi
     fi
 
-    # 5. 构建 Xray 配置中的 IPv6 专属分流规则块
+    # 5. 构建 Xray 配置中的 IPv6 专属分流规则块 (编号与菜单 1/2/3/4 严格对齐)
     local v6_rule_block=""
     local dns_query_strat="UseIPv4"
+    local freedom_dom_strat="UseIPv4"
 
-    if [[ "${IPV6_STRATEGY:-1}" == "1" ]]; then
-        # 阻断所有直连 IPv6 目标请求，DNS 严格锁定 UseIPv4
-        v6_rule_block=$(cat <<'EOF'
+    case "${IPV6_STRATEGY:-1}" in
+        1|2)
+            # 1=系统内核禁用, 2=代理层阻断: 均在 Xray 路由层阻断 ::/0 并锁定 DNS 为 UseIPv4
+            v6_rule_block=$(cat <<'EOF'
       {
         "type": "field",
         "ip": ["::/0"],
@@ -1118,25 +1289,39 @@ except Exception as e:
       },
 EOF
 )
-        dns_query_strat="UseIPv4"
-    elif [[ "${IPV6_STRATEGY:-1}" == "2" ]]; then
-        # IPv6 目标走 WARP
-        v6_rule_block=$(cat <<'EOF'
+            dns_query_strat="UseIPv4"
+            freedom_dom_strat="UseIPv4"
+            ;;
+        3)
+            # 3=IPv6 走 WARP 兜底 (若 WARP 可用则走 warp，否则阻断防泄露)
+            local v6_target_tag="block"
+            [[ "$has_warp" == "true" ]] && v6_target_tag="warp"
+            v6_rule_block=$(cat <<EOF
       {
         "type": "field",
         "ip": ["::/0"],
-        "outboundTag": "warp"
+        "outboundTag": "${v6_target_tag}"
       },
 EOF
 )
-        dns_query_strat="UseIPv4"
-    else
-        v6_rule_block=""
-        dns_query_strat="UseIP"
+            dns_query_strat="UseIP"
+            freedom_dom_strat="UseIPv4"
+            ;;
+        *)
+            # 4=恢复原生双栈直连: 解锁 DNS 与 freedom 出站的 IPv6 能力
+            v6_rule_block=""
+            dns_query_strat="UseIP"
+            freedom_dom_strat="UseIP"
+            ;;
+    esac
+
+    local warp_addr_json="\"${warp_v4}\""
+    if [[ -n "$warp_v6" ]]; then
+        warp_addr_json="\"${warp_v4}\", \"${warp_v6}\""
     fi
 
     # 6. 写入具有三重闭环与 DoH 加密解析的 config.json
-    msg_info "写入 Xray 生产级配置文件: /usr/local/etc/xray/config.json ..."
+    [[ "$run_mode" != "silent" ]] && msg_info "写入 Xray 生产级配置文件: /usr/local/etc/xray/config.json ..."
     mkdir -p /usr/local/etc/xray /var/log/xray
     chown -R nobody:nogroup /var/log/xray
 
@@ -1205,7 +1390,7 @@ EOF
     {
       "protocol": "freedom",
       "settings": {
-        "domainStrategy": "UseIPv4"
+        "domainStrategy": "${freedom_dom_strat}"
       },
       "tag": "direct"
     },
@@ -1219,7 +1404,7 @@ EOF
       "settings": {
         "secretKey": "${warp_priv}",
         "address": [
-          "${warp_v4}"
+          ${warp_addr_json}
         ],
         "peers": [
           {
@@ -1318,7 +1503,7 @@ ${v6_rule_block}
 EOF
 
     # 7. 配置 Logrotate 轮转规则
-    msg_info "配置 /etc/logrotate.d/xray 日志安全轮转 (每日轮转 / 单文件上限 20MB / 保留 7 份)..."
+    [[ "$run_mode" != "silent" ]] && msg_info "配置 /etc/logrotate.d/xray 日志安全轮转 (每日轮转 / 单文件上限 20MB / 保留 7 份)..."
     cat <<'EOF' > /etc/logrotate.d/xray
 /var/log/xray/*.log {
     daily
@@ -1338,7 +1523,7 @@ EOF
     if xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1; then
         systemctl restart xray
         systemctl enable xray >/dev/null 2>&1
-        msg_ok "Xray 核心已成功启动并设置为开机自启！"
+        [[ "$run_mode" != "silent" ]] && msg_ok "Xray 核心已成功启动并设置为开机自启！"
     else
         msg_err "Xray 配置文件测试失败，请检查 /usr/local/etc/xray/config.json"
         exit 1
@@ -1384,7 +1569,21 @@ optional_community_extensions() {
 generate_client_configs() {
     msg_step "【交付物】生成客户端开箱即用型订阅配置"
 
+    # 若从菜单 [4] 单独进入，动态回填当前 SSH 端口与运维用户，防未定义报错
+    if [[ -z "${TARGET_SSH_PORT:-}" ]]; then
+        TARGET_SSH_PORT=$(get_current_ssh_port)
+    fi
+    if [[ -z "${MAINT_USER:-}" ]]; then
+        local existing_s=($(detect_existing_sudoers))
+        if [[ ${#existing_s[@]} -gt 0 ]]; then
+            MAINT_USER="${existing_s[0]}"
+        else
+            MAINT_USER="root"
+        fi
+    fi
+
     local default_node_title="${NODE_FLAG} ${NODE_CITY} 落地"
+    local encoded_city="${NODE_CITY// /%20}"
 
     echo ""
     read -rp "请输入为此节点绑定的【直连域名】 (如 us-2-dir.yourdomain.com，直接回车使用公网 IP): " input_dir_dom
@@ -1406,6 +1605,7 @@ generate_client_configs() {
     echo -e "  Reality ShortId   : ${BOLD}${REALITY_SHORT_ID}${NC}"
     echo -e "  VLESS UUID        : ${BOLD}${VLESS_UUID}${NC}"
     echo -e "  Client Fingerprint: ${BOLD}chrome${NC}"
+    echo -e "  全局快捷启动命令  : ${BOLD}${GREEN}nw${NC} 或 ${BOLD}${GREEN}nodewiz${NC} (随时呼出管理面板)"
     echo -e "  核心安全防线      : ${BOLD}UFW 白名单 / Fail2ban / Geolocation黑洞 / WARP兜底 / BBR${NC}"
     echo "=========================================================================="
 
@@ -1450,9 +1650,9 @@ EOF
 
     echo -e "\n${BOLD}${BLUE}【2. Shadowrocket / 通用一键导入链接】${NC}"
     echo -e "* 直连模式："
-    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_dir}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${NODE_FLAG}%20${NODE_CITY}%E7%9B%B4%E8%BF%9E${NC}"
+    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_dir}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
     echo -e "* 链式中继落地模式："
-    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_rly}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${NODE_FLAG}%20${NODE_CITY}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
+    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_rly}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
 
     echo -e "\n=========================================================================="
     echo -e "                   ${BOLD}${RED}⚠️  新机上线后必做的 3 项外部核验 ⚠️${NC}"
@@ -1502,12 +1702,40 @@ run_proxy_only() {
 }
 
 main() {
-    check_environment
+    check_environment "$@"
+
+    if [[ "${1:-}" =~ ^(help|-h|--help)$ ]]; then
+        echo -e "${BOLD}${CYAN}NodeWizard 快捷命令行用法:${NC}"
+        echo -e "  ${GREEN}nw${NC} / ${GREEN}nodewiz${NC}          启动交互式主菜单"
+        echo -e "  ${GREEN}nw status${NC}             直接查看当前节点配置巡检看板"
+        echo -e "  ${GREEN}nw link${NC}               直接提取 Clash Meta / Shadowrocket 节点订阅链接"
+        echo -e "  ${GREEN}nw update${NC}             从云端同步更新最新版本的 NodeWizard 脚本"
+        exit 0
+    fi
+
+    if [[ "${1:-}" =~ ^(update|upgrade|-u)$ ]]; then
+        update_script
+        exit 0
+    fi
+
     detect_node_geo
+
+    # 支持命令行快捷参数: nw status | nw link
+    case "${1:-}" in
+        status|check|-s)
+            audit_node_status "cli"
+            exit 0
+            ;;
+        link|links|sub|-l)
+            view_client_configs "cli"
+            exit 0
+            ;;
+    esac
 
     while true; do
         print_banner
-        echo -e "当前节点定位: ${BOLD}${NODE_FLAG} ${NODE_COUNTRY} - ${NODE_CITY}${NC} (IP: ${CYAN}${SERVER_IP}${NC})\n"
+        echo -e "当前节点定位: ${BOLD}${NODE_FLAG} ${NODE_COUNTRY} - ${NODE_CITY}${NC} (IP: ${CYAN}${SERVER_IP}${NC})"
+        echo -e "全局快捷指令: 随时在终端输入 ${BOLD}${GREEN}nw${NC} 或 ${BOLD}${GREEN}nodewiz${NC} 即可呼出本面板 (支持 ${CYAN}nw status / nw link / nw update${NC})\n"
         echo -e "请选择操作模式："
         echo -e "  ${BOLD}[1]${NC} ${GREEN}🚀 一键开启 NodeWizard 全自动交付 (基座加固 + Xray + WARP + 订阅)${NC}"
         echo -e "  ${BOLD}[2]${NC} ${CYAN}🔍 巡检当前节点配置状态 (查看已配端口/用户/防火墙/BBR/代理状态)${NC}"
@@ -1515,9 +1743,10 @@ main() {
         echo -e "  ${BOLD}[4]${NC} ⚡ 仅安装 / 重构 Xray-Reality 核心与 WARP 路由矩阵"
         echo -e "  ${BOLD}[5]${NC} ${YELLOW}📋 查看当前客户端节点配置与订阅链接 (Clash Meta / Shadowrocket)${NC}"
         echo -e "  ${BOLD}[6]${NC} ${MAGENTA}🌐 IPv6 双栈治理与出站策略管理 (内核阻断/代理阻断/WARP代付/一键恢复)${NC}"
+        echo -e "  ${BOLD}[7]${NC} ${BLUE}🔄 在线更新 NodeWizard 脚本 (从云端拉取最新版本)${NC}"
         echo -e "  ${BOLD}[0]${NC} 退出 NodeWizard"
         echo "=========================================================================="
-        read -rp "请输入选项编号 [0-6] (默认 1): " main_opt
+        read -rp "请输入选项编号 [0-7] (默认 1): " main_opt
         main_opt=${main_opt:-1}
 
         case "$main_opt" in
@@ -1542,8 +1771,11 @@ main() {
             6)
                 manage_ipv6_menu
                 ;;
+            7)
+                update_script
+                ;;
             0)
-                echo -e "\n已退出 NodeWizard。祝使用愉快！"
+                echo -e "\n已退出 NodeWizard。后续随时输入 ${BOLD}${GREEN}nw${NC} 即可再次唤醒！"
                 exit 0
                 ;;
             *)

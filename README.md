@@ -37,6 +37,9 @@ Interactive terminal menu options:
 - **[4] Proxy Only**: Configure proxy backend and outbound routing.
 - **[5] View Client Configs**: Export connection links and configurations.
 - **[6] IPv6 Management**: Dual-stack routing governance and outbound policy toggle.
+- **[7] Update Script**: Sync the latest version from remote.
+
+Once executed, global shortcuts `nw` and `nodewiz` are installed automatically (`nw`, `nw status`, `nw link`, `nw update`).
 
 ## Requirements
 
