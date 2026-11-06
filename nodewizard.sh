@@ -364,7 +364,7 @@ audit_node_status() {
         local svc_user
         svc_user=$(systemctl show -p User --value xray 2>/dev/null || echo "root")
         [[ -z "$svc_user" ]] && svc_user="root"
-        echo -e "  Xray 服务状态     : ${BOLD}${GREEN}运行中 (Active)${NC} (版本: $(xray version 2>/dev/null | head -n1 | awk '{print $2}') / 运行账户: ${svc_user})"
+        echo -e "  Xray 服务状态     : ${BOLD}${GREEN}运行中 (Active)${NC} (版本: $(xray version 2>/dev/null | awk 'NR==1{print $2}') / 运行账户: ${svc_user})"
         if [[ -f /usr/local/etc/xray/config.json ]]; then
             local curr_sni curr_uuid min_ver
             curr_sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // "未知"' /usr/local/etc/xray/config.json 2>/dev/null)
@@ -1165,9 +1165,9 @@ setup_xray_and_warp() {
     # 1. 安装 Xray 官方最新核心
     if ! command -v xray >/dev/null 2>&1; then
         msg_info "正在通过官方安装脚本部署最新 Xray-core..."
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
+        bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
     fi
-    [[ "$run_mode" != "silent" ]] && msg_ok "Xray 核心已就绪 ($(xray version | head -n1 | awk '{print $2}'))"
+    [[ "$run_mode" != "silent" ]] && msg_ok "Xray 核心已就绪 ($(xray version 2>/dev/null | awk 'NR==1{print $2}'))"
 
     # 2. 创建系统级专用服务账户 xray:xray 并配置 Linux Capabilities 特权绑定
     getent group xray >/dev/null 2>&1 || groupadd -r xray 2>/dev/null || true
@@ -1749,13 +1749,15 @@ upgrade_xray_core_and_migrate() {
     # 2. 升级 Xray-core 与 GeoIP/GeoSite 路由规则库
     local old_xray_ver="未安装"
     if command -v xray >/dev/null 2>&1; then
-        old_xray_ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+        old_xray_ver=$(xray version 2>/dev/null | awk 'NR==1{print $2}')
+        [[ -z "$old_xray_ver" ]] && old_xray_ver="未知"
     fi
     msg_info "2/4 正在拉取官方最新 Xray-core 及 GeoIP/GeoSite 路由数据库 (当前版本: ${old_xray_ver})..."
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 || true
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 || true
     local new_xray_ver
-    new_xray_ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+    new_xray_ver=$(xray version 2>/dev/null | awk 'NR==1{print $2}')
+    [[ -z "$new_xray_ver" ]] && new_xray_ver="未知"
     msg_ok "Xray-core 及 Geo 路由库已升级完成: ${BOLD}${YELLOW}${old_xray_ver}${NC} -> ${BOLD}${GREEN}${new_xray_ver}${NC}"
 
     # 3. 同步更新 tcpfit 工具
@@ -1791,7 +1793,8 @@ manage_update_menu() {
         print_banner
         local cur_xver="未安装"
         if command -v xray >/dev/null 2>&1; then
-            cur_xver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+            cur_xver=$(xray version 2>/dev/null | awk 'NR==1{print $2}')
+            [[ -z "$cur_xver" ]] && cur_xver="未知"
         fi
         echo -e "${BOLD}${CYAN}🔄【更新与维护中心 (Core & GeoData & Config Migration)】${NC}\n"
         echo -e "  * 当前 Xray 核心版本 : ${BOLD}${GREEN}${cur_xver}${NC}"
