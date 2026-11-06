@@ -38,6 +38,8 @@ msg_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 msg_err()  { echo -e "${RED}[ERR ]${NC} $*"; }
 msg_step() { echo -e "\n${BOLD}${BLUE}==>${NC} ${BOLD}$*${NC}"; }
 
+NW_VERSION="v2.4.0"
+NW_UPDATED="2026-11-06"
 DEFAULT_SAFE_USER="safeuser"
 SCRIPT_URL="https://raw.githubusercontent.com/JohnsonGond/NodeWizard/main/nodewizard.sh"
 SHORT_URL="https://nw.531555.xyz"
@@ -75,10 +77,19 @@ print_banner() {
  |_| \_|\___/ \__,_|\___|  \_/\_/  |_/___|\__,_|_|  \__,_|
 BANNER
     echo -e "${NC}"
-    echo -e "  ${BOLD}${MAGENTA}🧙‍♂️ Cloud Infrastructure Node Provisioning Wizard (NodeWizard)${NC}"
+    echo -e "  ${BOLD}${MAGENTA}🧙‍♂️ Cloud Infrastructure Node Provisioning Wizard (NodeWizard ${GREEN}${NW_VERSION}${MAGENTA})${NC}"
     echo -e "  ${CYAN}工业级基座加固 · 动态地理感知 · Xray+WARP 深度路由 · 快捷命令: ${BOLD}${GREEN}nw${NC}${CYAN} / ${BOLD}${GREEN}nodewiz${NC}"
     echo "=========================================================================="
     echo ""
+}
+
+get_remote_version() {
+    local r_ver=""
+    r_ver=$(curl -fsSL --max-time 3 "$SHORT_URL" 2>/dev/null | grep -m1 '^NW_VERSION=' | cut -d'"' -f2 || true)
+    if [[ -z "$r_ver" ]]; then
+        r_ver=$(curl -fsSL --max-time 3 "$SCRIPT_URL" 2>/dev/null | grep -m1 '^NW_VERSION=' | cut -d'"' -f2 || true)
+    fi
+    echo "${r_ver:-未知}"
 }
 
 # ── 2. 运行权限校验、快捷命令安装与自动更新 ─────────────────────────────────
@@ -110,6 +121,8 @@ update_script() {
     local tmp_up="/tmp/nodewizard_update_$$.sh"
     if curl -fsSL --max-time 15 "$SHORT_URL" -o "$tmp_up" 2>/dev/null || curl -fsSL --max-time 15 "$SCRIPT_URL" -o "$tmp_up" 2>/dev/null; then
         if bash -n "$tmp_up" 2>/dev/null && grep -q "NodeWizard" "$tmp_up" 2>/dev/null; then
+            local new_ver
+            new_ver=$(grep -m1 '^NW_VERSION=' "$tmp_up" 2>/dev/null | cut -d'"' -f2 || echo "$NW_VERSION")
             mv -f "$tmp_up" "$INSTALL_PATH"
             chmod +x "$INSTALL_PATH"
             ln -sf "$INSTALL_PATH" "$ALIAS_PATH" 2>/dev/null || true
@@ -117,7 +130,7 @@ update_script() {
             if [[ -f "./nodewizard.sh" && ! -d "./.git" ]]; then
                 cp -f "$INSTALL_PATH" "./nodewizard.sh" 2>/dev/null || true
             fi
-            msg_ok "NodeWizard 已成功更新至最新版本！(快捷命令: nw / nodewiz)"
+            msg_ok "NodeWizard 已成功更新至最新版本: ${BOLD}${YELLOW}${NW_VERSION}${NC} -> ${BOLD}${GREEN}${new_ver}${NC} (快捷命令: nw / nodewiz)"
             sleep 1
             if [[ -n "$next_action" ]]; then
                 exec "$INSTALL_PATH" "$next_action"
@@ -1857,7 +1870,17 @@ manage_update_menu() {
             cur_xver=$(xray version 2>/dev/null | awk 'NR==1{print $2}')
             [[ -z "$cur_xver" ]] && cur_xver="未知"
         fi
+        local remote_ver ver_badge
+        remote_ver=$(get_remote_version)
+        if [[ "$remote_ver" == "$NW_VERSION" ]]; then
+            ver_badge="${GREEN}(云端最新: ${remote_ver} — 已是最新 ✅)${NC}"
+        elif [[ "$remote_ver" == "未知" ]]; then
+            ver_badge="${YELLOW}(云端版本检测超时)${NC}"
+        else
+            ver_badge="${YELLOW}${BOLD}(发现云端新版本: ${remote_ver} 🔔 建议更新)${NC}"
+        fi
         echo -e "${BOLD}${CYAN}🔄【更新与维护中心 (Core & GeoData & Config Migration)】${NC}\n"
+        echo -e "  * 当前脚本版本       : ${BOLD}${GREEN}${NW_VERSION}${NC} (${NW_UPDATED}) ${ver_badge}"
         echo -e "  * 当前 Xray 核心版本 : ${BOLD}${GREEN}${cur_xver}${NC}"
         echo -e "  * 快捷命令安装路径   : ${BOLD}${INSTALL_PATH}${NC} (别名: ${ALIAS_PATH})\n"
         echo -e "请选择维护操作："
@@ -1922,13 +1945,21 @@ run_proxy_only() {
 main() {
     check_environment "$@"
 
+    if [[ "${1:-}" =~ ^(version|-v|--version)$ ]]; then
+        local r_v
+        r_v=$(get_remote_version)
+        echo -e "${BOLD}${CYAN}NodeWizard${NC} 本地版本: ${BOLD}${GREEN}${NW_VERSION}${NC} (${NW_UPDATED}) | 云端最新: ${BOLD}${YELLOW}${r_v}${NC}"
+        exit 0
+    fi
+
     if [[ "${1:-}" =~ ^(help|-h|--help)$ ]]; then
-        echo -e "${BOLD}${CYAN}NodeWizard 快捷命令行用法:${NC}"
+        echo -e "${BOLD}${CYAN}NodeWizard (${NW_VERSION}) 快捷命令行用法:${NC}"
         echo -e "  ${GREEN}nw${NC} / ${GREEN}nodewiz${NC}          启动交互式主菜单"
         echo -e "  ${GREEN}nw status${NC}             直接查看当前节点配置巡检看板"
         echo -e "  ${GREEN}nw link${NC}               直接提取 Clash Meta / Shadowrocket 节点订阅链接"
         echo -e "  ${GREEN}nw upgrade${NC}            升级 Xray 核心、Geo 规则库并无损迁移最新配置规范"
         echo -e "  ${GREEN}nw update${NC}             从云端同步更新最新版本的 NodeWizard 脚本"
+        echo -e "  ${GREEN}nw -v${NC}                 查看本地与云端最新脚本版本号"
         exit 0
     fi
 
