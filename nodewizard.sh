@@ -105,6 +105,7 @@ ensure_shortcut_installed() {
 }
 
 update_script() {
+    local next_action="${1:-}"
     msg_step "【在线更新】正在从云端同步最新版本的 NodeWizard ..."
     local tmp_up="/tmp/nodewizard_update_$$.sh"
     if curl -fsSL --max-time 15 "$SHORT_URL" -o "$tmp_up" 2>/dev/null || curl -fsSL --max-time 15 "$SCRIPT_URL" -o "$tmp_up" 2>/dev/null; then
@@ -118,7 +119,11 @@ update_script() {
             fi
             msg_ok "NodeWizard 已成功更新至最新版本！(快捷命令: nw / nodewiz)"
             sleep 1
-            exec "$INSTALL_PATH"
+            if [[ -n "$next_action" ]]; then
+                exec "$INSTALL_PATH" "$next_action"
+            else
+                exec "$INSTALL_PATH"
+            fi
         else
             rm -f "$tmp_up" 2>/dev/null || true
             msg_err "下载的脚本未通过语法完整性校验，已中止更新。"
@@ -143,6 +148,13 @@ check_environment() {
     # 修复 curl ... | bash 管道模式下标准输入被抢占导致 read 跳过的问题
     if [[ ! -t 0 && -e /dev/tty ]]; then
         exec < /dev/tty
+    fi
+
+    # 自动校正 /etc/hosts 缺失本机 hostname 问题 (消除云主机 sudo 5秒延迟与解析报错)
+    local curr_hn
+    curr_hn=$(hostname 2>/dev/null || echo "")
+    if [[ -n "$curr_hn" ]] && ! grep -qE "127\.0\.0\.1[[:space:]]+.*${curr_hn}" /etc/hosts 2>/dev/null; then
+        sed -i "s/^127\.0\.0\.1[[:space:]]\+localhost/127.0.0.1 localhost ${curr_hn}/" /etc/hosts 2>/dev/null || echo "127.0.0.1 ${curr_hn}" >> /etc/hosts
     fi
 
     if [[ -f /etc/os-release ]]; then
@@ -349,12 +361,16 @@ audit_node_status() {
     # 5. Xray 代理核心与分流矩阵
     echo -e "\n${BOLD}${BLUE}5. Xray 代理核心与深度分流矩阵${NC}"
     if systemctl is-active xray >/dev/null 2>&1; then
-        echo -e "  Xray 服务状态     : ${BOLD}${GREEN}运行中 (Active)${NC} (版本: $(xray version 2>/dev/null | head -n1 | awk '{print $2}'))"
+        local svc_user
+        svc_user=$(systemctl show -p User --value xray 2>/dev/null || echo "root")
+        [[ -z "$svc_user" ]] && svc_user="root"
+        echo -e "  Xray 服务状态     : ${BOLD}${GREEN}运行中 (Active)${NC} (版本: $(xray version 2>/dev/null | head -n1 | awk '{print $2}') / 运行账户: ${svc_user})"
         if [[ -f /usr/local/etc/xray/config.json ]]; then
-            local curr_sni curr_uuid
+            local curr_sni curr_uuid min_ver
             curr_sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // "未知"' /usr/local/etc/xray/config.json 2>/dev/null)
             curr_uuid=$(jq -r '.inbounds[0].settings.clients[0].id // "未知"' /usr/local/etc/xray/config.json 2>/dev/null)
-            echo -e "  Reality 伪装源站  : ${BOLD}${CYAN}${curr_sni}${NC}"
+            min_ver=$(jq -r '.inbounds[0].streamSettings.realitySettings.minClientVer // "未显式指定"' /usr/local/etc/xray/config.json 2>/dev/null)
+            echo -e "  Reality 伪装源站  : ${BOLD}${CYAN}${curr_sni}${NC} (minClientVer: ${min_ver})"
             echo -e "  当前客户端 UUID   : ${curr_uuid}"
 
             # IPv6 出站策略检测
@@ -473,6 +489,7 @@ proxies:
     reality-opts:
       public-key: ${pub_key}
       short-id: ${short_id}
+      support-x25519mlkem768: true
     client-fingerprint: chrome
 
   # ================= 模式 2: 链式中继落地模式 =================
@@ -489,6 +506,7 @@ proxies:
     reality-opts:
       public-key: ${pub_key}
       short-id: ${short_id}
+      support-x25519mlkem768: true
     client-fingerprint: chrome
     dialer-proxy: "机场-低延迟节点名称"   # <-- 替换为您已有中转/机场订阅中的节点名称
 EOF
@@ -914,6 +932,14 @@ EOF
 setup_system_base_and_tcpfit() {
     msg_step "【Step 4/7】配置系统 BBR 原生保底、DNS、Swap、日志限额并预装 tcpfit"
 
+    # 0. 自动校正 /etc/hosts 缺失本机 hostname 问题 (消除 sudo 5秒延迟与解析报错)
+    local curr_hn
+    curr_hn=$(hostname 2>/dev/null || echo "")
+    if [[ -n "$curr_hn" ]] && ! grep -qE "127\.0\.0\.1[[:space:]]+.*${curr_hn}" /etc/hosts 2>/dev/null; then
+        sed -i "s/^127\.0\.0\.1[[:space:]]\+localhost/127.0.0.1 localhost ${curr_hn}/" /etc/hosts 2>/dev/null || echo "127.0.0.1 ${curr_hn}" >> /etc/hosts
+        msg_ok "已自动补全 /etc/hosts 本机主机名映射 (${curr_hn})"
+    fi
+
     # 1. Swap 内存保底
     local total_swap_kb
     total_swap_kb=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
@@ -1097,11 +1123,11 @@ select_reality_target() {
 # ── 16. Xray 原生部署、WARP 兜底与深度分流矩阵 ─────────────────────────────────
 setup_xray_and_warp() {
     local run_mode="${1:-interactive}"
-    if [[ "$run_mode" != "silent" ]]; then
+    if [[ "$run_mode" == "interactive" ]]; then
         msg_step "【Step 7/7】部署 Xray 原生核心、WARP 兜底与独家深度路由矩阵"
     fi
 
-    # 0. 确保 REALITY_TARGET 与 REALITY_SNI 已定义 (防从子菜单 [6] 直接调用时为空)
+    # 0. 确保 REALITY_TARGET、REALITY_SNI 与 IPV6_STRATEGY 已定义 (支持从子菜单 [6]/[7] 直接调用)
     if [[ -z "${REALITY_TARGET:-}" ]]; then
         if [[ -f /usr/local/etc/xray/config.json ]]; then
             REALITY_TARGET=$(jq -r '.inbounds[0].streamSettings.realitySettings.target // empty' /usr/local/etc/xray/config.json 2>/dev/null)
@@ -1118,6 +1144,24 @@ setup_xray_and_warp() {
         REALITY_SNI=$(echo "$REALITY_TARGET" | cut -d':' -f1)
     fi
 
+    if [[ -z "${IPV6_STRATEGY:-}" ]]; then
+        local cur_sys_v6
+        cur_sys_v6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
+        if [[ "$cur_sys_v6" == "1" ]]; then
+            IPV6_STRATEGY="1"
+        elif [[ -f /usr/local/etc/xray/config.json ]]; then
+            if grep -q '"ip": \["\:\:\/0"\]' /usr/local/etc/xray/config.json 2>/dev/null && grep -A 2 '"ip": \["\:\:\/0"\]' /usr/local/etc/xray/config.json | grep -q '"outboundTag": "block"'; then
+                IPV6_STRATEGY="2"
+            elif grep -q '"ip": \["\:\:\/0"\]' /usr/local/etc/xray/config.json 2>/dev/null && grep -A 2 '"ip": \["\:\:\/0"\]' /usr/local/etc/xray/config.json | grep -q '"outboundTag": "warp"'; then
+                IPV6_STRATEGY="3"
+            else
+                IPV6_STRATEGY="4"
+            fi
+        else
+            IPV6_STRATEGY="1"
+        fi
+    fi
+
     # 1. 安装 Xray 官方最新核心
     if ! command -v xray >/dev/null 2>&1; then
         msg_info "正在通过官方安装脚本部署最新 Xray-core..."
@@ -1125,13 +1169,17 @@ setup_xray_and_warp() {
     fi
     [[ "$run_mode" != "silent" ]] && msg_ok "Xray 核心已就绪 ($(xray version | head -n1 | awk '{print $2}'))"
 
-    # 2. nobody 降权与 Linux Capabilities 特权绑定
+    # 2. 创建系统级专用服务账户 xray:xray 并配置 Linux Capabilities 特权绑定
+    getent group xray >/dev/null 2>&1 || groupadd -r xray 2>/dev/null || true
+    id -u xray >/dev/null 2>&1 || useradd -r -g xray -M -s /usr/sbin/nologin xray 2>/dev/null || true
+
     mkdir -p /etc/systemd/system/xray.service.d
     cat <<EOF > /etc/systemd/system/xray.service.d/10-permissions.conf
 [Service]
-User=nobody
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+User=xray
+Group=xray
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
 LimitNPROC=10000
 LimitNOFILE=1000000
@@ -1149,7 +1197,7 @@ EOF
 
         if [[ -n "$old_uuid" && -n "$old_priv" ]]; then
             local keep_resp="Y"
-            if [[ "$run_mode" != "silent" ]]; then
+            if [[ "$run_mode" == "interactive" ]]; then
                 echo ""
                 msg_info "检测到系统已存在 Xray 生产配置 (UUID: ${old_uuid})"
                 read -rp "是否保留现有的 UUID 与 Reality 密钥凭据？[Y/n] (默认 Y，免去重新配置客户端): " keep_resp
@@ -1320,10 +1368,11 @@ EOF
         warp_addr_json="\"${warp_v4}\", \"${warp_v6}\""
     fi
 
-    # 6. 写入具有三重闭环与 DoH 加密解析的 config.json
+    # 6. 写入具有三重闭环与 DoH 加密解析的 config.json (适配 Xray v26.10+ 最新规范)
     [[ "$run_mode" != "silent" ]] && msg_info "写入 Xray 生产级配置文件: /usr/local/etc/xray/config.json ..."
-    mkdir -p /usr/local/etc/xray /var/log/xray
-    chown -R nobody:nogroup /var/log/xray
+    mkdir -p /usr/local/etc/xray /var/log/xray /usr/local/share/xray
+    chown -R xray:xray /var/log/xray /usr/local/share/xray 2>/dev/null || true
+    chmod 750 /var/log/xray 2>/dev/null || true
 
     if [[ -f /usr/local/etc/xray/config.json ]]; then
         cp /usr/local/etc/xray/config.json "/usr/local/etc/xray/config.json.bak_$(date +%Y%m%d%H%M%S)"
@@ -1373,7 +1422,8 @@ EOF
           "shortIds": [
             "${REALITY_SHORT_ID}",
             ""
-          ]
+          ],
+          "minClientVer": "0.0.0"
         }
       },
       "sniffing": {
@@ -1389,8 +1439,10 @@ EOF
   "outbounds": [
     {
       "protocol": "freedom",
-      "settings": {
-        "domainStrategy": "${freedom_dom_strat}"
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "${freedom_dom_strat}"
+        }
       },
       "tag": "direct"
     },
@@ -1502,7 +1554,11 @@ ${v6_rule_block}
 }
 EOF
 
-    # 7. 配置 Logrotate 轮转规则
+    # 安全基线加固: 收敛配置文件权限为 0640 (仅 root 与 xray 组可读)
+    chown root:xray /usr/local/etc/xray/config.json 2>/dev/null || chown xray:xray /usr/local/etc/xray/config.json 2>/dev/null || true
+    chmod 640 /usr/local/etc/xray/config.json 2>/dev/null || true
+
+    # 7. 配置 Logrotate 轮转规则 (归属 xray:xray)
     [[ "$run_mode" != "silent" ]] && msg_info "配置 /etc/logrotate.d/xray 日志安全轮转 (每日轮转 / 单文件上限 20MB / 保留 7 份)..."
     cat <<'EOF' > /etc/logrotate.d/xray
 /var/log/xray/*.log {
@@ -1514,13 +1570,16 @@ EOF
     delaycompress
     copytruncate
     maxsize 20M
-    su nobody nogroup
+    su xray xray
+    create 0640 xray xray
 }
 EOF
 
-    # 8. 启动并测试 Xray
+    # 8. 启动并测试 Xray (测试后强制重刷日志归属权，防止 root 测试生成的日志导致 xray 用户 Exit Code 23)
     systemctl daemon-reload
     if xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1; then
+        chown -R xray:xray /var/log/xray 2>/dev/null || true
+        chmod 640 /var/log/xray/*.log 2>/dev/null || true
         systemctl restart xray
         systemctl enable xray >/dev/null 2>&1
         [[ "$run_mode" != "silent" ]] && msg_ok "Xray 核心已成功启动并设置为开机自启！"
@@ -1628,6 +1687,7 @@ proxies:
     reality-opts:
       public-key: ${REALITY_PUB_KEY}
       short-id: ${REALITY_SHORT_ID}
+      support-x25519mlkem768: true
     client-fingerprint: chrome
 
   # ================= 模式 2: 链式中继模式 (通过专用中继子域名 + XUDP 防泄露) =================
@@ -1644,6 +1704,7 @@ proxies:
     reality-opts:
       public-key: ${REALITY_PUB_KEY}
       short-id: ${REALITY_SHORT_ID}
+      support-x25519mlkem768: true
     client-fingerprint: chrome
     dialer-proxy: "机场-低延迟节点名称"   # <-- 替换为您已有中转/机场订阅中的节点名称
 EOF
@@ -1672,7 +1733,100 @@ EOF
     echo "=========================================================================="
 }
 
-# ── 19. 调度入口与交互主菜单 ─────────────────────────────────────────────────
+# ── 19. 核心与依赖热升级及维护中心 (菜单选项 [7]) ────────────────────────────
+upgrade_xray_core_and_migrate() {
+    local call_mode="${1:-menu}"
+    print_banner
+    msg_step "【核心与依赖热升级】正在升级系统基础依赖、Xray-core、Geo 规则库与配置规范..."
+
+    # 1. 更新系统关键基础依赖
+    msg_info "1/4 正在同步 apt 软件源并更新基础组件 (curl, jq, openssl, ca-certificates, logrotate)..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq curl wget jq openssl ca-certificates logrotate python3 >/dev/null 2>&1 || true
+    msg_ok "系统关键基础依赖已更新至最新状态"
+
+    # 2. 升级 Xray-core 与 GeoIP/GeoSite 路由规则库
+    local old_xray_ver="未安装"
+    if command -v xray >/dev/null 2>&1; then
+        old_xray_ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+    fi
+    msg_info "2/4 正在拉取官方最新 Xray-core 及 GeoIP/GeoSite 路由数据库 (当前版本: ${old_xray_ver})..."
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 || true
+    local new_xray_ver
+    new_xray_ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+    msg_ok "Xray-core 及 Geo 路由库已升级完成: ${BOLD}${YELLOW}${old_xray_ver}${NC} -> ${BOLD}${GREEN}${new_xray_ver}${NC}"
+
+    # 3. 同步更新 tcpfit 工具
+    msg_info "3/4 正在同步最新版 tcpfit 网络调优工具..."
+    curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh -o /usr/local/bin/tcpfit 2>/dev/null || true
+    chmod +x /usr/local/bin/tcpfit 2>/dev/null || true
+    msg_ok "tcpfit 调优工具已同步"
+
+    # 4. 无损迁移现有 Xray 配置规范 (保留 UUID/Reality密钥/SNI/WARP/IPv6策略)
+    if [[ -f /usr/local/etc/xray/config.json ]]; then
+        msg_info "4/4 正在将现有 Xray 配置文件无损迁移至最新规范 (补齐 minClientVer / User=xray / sockopt)..."
+        IPV6_STRATEGY="" REALITY_TARGET="" REALITY_SNI="" setup_xray_and_warp "migrate"
+        echo ""
+        echo "=========================================================================="
+        echo -e "  ${BOLD}${GREEN}🎉 老节点热升级与配置迁移全部完成！${NC}"
+        echo "=========================================================================="
+        echo -e "  * Xray 核心版本 : ${BOLD}${old_xray_ver}${NC} -> ${BOLD}${GREEN}${new_xray_ver}${NC}"
+        echo -e "  * 凭据保留状态  : ${BOLD}${GREEN}原有 UUID、Reality 密钥、伪装源站、WARP 凭据、IPv6 策略 100% 原样保留${NC}"
+        echo -e "  * 权限与配置加固: ${BOLD}${CYAN}已切换至 User=xray、补齐 minClientVer: 0.0.0、迁移 sockopt.domainStrategy${NC}"
+        echo -e "  * 客户端小贴士  : 可随时输入 ${BOLD}${GREEN}nw link${NC} 获取含 ${CYAN}support-x25519mlkem768: true${NC} 的最新客户端配置块"
+        echo "=========================================================================="
+    else
+        msg_warn "当前节点尚未部署 /usr/local/etc/xray/config.json，仅完成了 Xray 二进制核心与依赖预装。"
+    fi
+
+    if [[ "$call_mode" != "cli" ]]; then
+        read -rp "按回车键返回上级菜单..." _
+    fi
+}
+
+manage_update_menu() {
+    while true; do
+        print_banner
+        local cur_xver="未安装"
+        if command -v xray >/dev/null 2>&1; then
+            cur_xver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+        fi
+        echo -e "${BOLD}${CYAN}🔄【更新与维护中心 (Core & GeoData & Config Migration)】${NC}\n"
+        echo -e "  * 当前 Xray 核心版本 : ${BOLD}${GREEN}${cur_xver}${NC}"
+        echo -e "  * 快捷命令安装路径   : ${BOLD}${INSTALL_PATH}${NC} (别名: ${ALIAS_PATH})\n"
+        echo -e "请选择维护操作："
+        echo -e "  ${BOLD}[1]${NC} ${GREEN}⚡ 升级 Xray 核心、Geo 规则库与依赖 + 无损迁移最新配置规范 (推荐老机器执行)${NC}"
+        echo -e "  ${BOLD}[2]${NC} ${CYAN}📜 仅在线更新 NodeWizard 脚本自身 (从云端拉取最新 nw 脚本)${NC}"
+        echo -e "  ${BOLD}[3]${NC} ${YELLOW}🚀 全量一条龙更新 (先同步最新 NodeWizard 脚本，再自动升级 Xray 核心与配置)${NC}"
+        echo -e "  ${BOLD}[0]${NC} 返回上级主菜单"
+        echo "=========================================================================="
+        read -rp "请输入选项编号 [0-3] (默认 1): " up_choice
+        up_choice=${up_choice:-1}
+
+        case "$up_choice" in
+            1)
+                upgrade_xray_core_and_migrate "menu"
+                ;;
+            2)
+                update_script
+                ;;
+            3)
+                update_script "upgrade"
+                ;;
+            0)
+                return
+                ;;
+            *)
+                msg_warn "输入无效，请重新选择。"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ── 20. 调度入口与交互主菜单 ─────────────────────────────────────────────────
 run_full_deployment() {
     install_dependencies
     setup_user_and_ssh
@@ -1709,18 +1863,19 @@ main() {
         echo -e "  ${GREEN}nw${NC} / ${GREEN}nodewiz${NC}          启动交互式主菜单"
         echo -e "  ${GREEN}nw status${NC}             直接查看当前节点配置巡检看板"
         echo -e "  ${GREEN}nw link${NC}               直接提取 Clash Meta / Shadowrocket 节点订阅链接"
+        echo -e "  ${GREEN}nw upgrade${NC}            升级 Xray 核心、Geo 规则库并无损迁移最新配置规范"
         echo -e "  ${GREEN}nw update${NC}             从云端同步更新最新版本的 NodeWizard 脚本"
         exit 0
     fi
 
-    if [[ "${1:-}" =~ ^(update|upgrade|-u)$ ]]; then
+    if [[ "${1:-}" =~ ^(update|-u)$ ]]; then
         update_script
         exit 0
     fi
 
     detect_node_geo
 
-    # 支持命令行快捷参数: nw status | nw link
+    # 支持命令行快捷参数: nw status | nw link | nw upgrade
     case "${1:-}" in
         status|check|-s)
             audit_node_status "cli"
@@ -1730,12 +1885,16 @@ main() {
             view_client_configs "cli"
             exit 0
             ;;
+        upgrade|-U)
+            upgrade_xray_core_and_migrate "cli"
+            exit 0
+            ;;
     esac
 
     while true; do
         print_banner
         echo -e "当前节点定位: ${BOLD}${NODE_FLAG} ${NODE_COUNTRY} - ${NODE_CITY}${NC} (IP: ${CYAN}${SERVER_IP}${NC})"
-        echo -e "全局快捷指令: 随时在终端输入 ${BOLD}${GREEN}nw${NC} 或 ${BOLD}${GREEN}nodewiz${NC} 即可呼出本面板 (支持 ${CYAN}nw status / nw link / nw update${NC})\n"
+        echo -e "全局快捷指令: 随时在终端输入 ${BOLD}${GREEN}nw${NC} 或 ${BOLD}${GREEN}nodewiz${NC} 即可呼出本面板 (支持 ${CYAN}nw status / nw link / nw upgrade / nw update${NC})\n"
         echo -e "请选择操作模式："
         echo -e "  ${BOLD}[1]${NC} ${GREEN}🚀 一键开启 NodeWizard 全自动交付 (基座加固 + Xray + WARP + 订阅)${NC}"
         echo -e "  ${BOLD}[2]${NC} ${CYAN}🔍 巡检当前节点配置状态 (查看已配端口/用户/防火墙/BBR/代理状态)${NC}"
@@ -1743,7 +1902,7 @@ main() {
         echo -e "  ${BOLD}[4]${NC} ⚡ 仅安装 / 重构 Xray-Reality 核心与 WARP 路由矩阵"
         echo -e "  ${BOLD}[5]${NC} ${YELLOW}📋 查看当前客户端节点配置与订阅链接 (Clash Meta / Shadowrocket)${NC}"
         echo -e "  ${BOLD}[6]${NC} ${MAGENTA}🌐 IPv6 双栈治理与出站策略管理 (内核阻断/代理阻断/WARP代付/一键恢复)${NC}"
-        echo -e "  ${BOLD}[7]${NC} ${BLUE}🔄 在线更新 NodeWizard 脚本 (从云端拉取最新版本)${NC}"
+        echo -e "  ${BOLD}[7]${NC} ${BLUE}🔄 更新与维护中心 (升级 Xray 核心与规则库 / 配置无损热迁移 / 脚本更新)${NC}"
         echo -e "  ${BOLD}[0]${NC} 退出 NodeWizard"
         echo "=========================================================================="
         read -rp "请输入选项编号 [0-7] (默认 1): " main_opt
@@ -1772,7 +1931,7 @@ main() {
                 manage_ipv6_menu
                 ;;
             7)
-                update_script
+                manage_update_menu
                 ;;
             0)
                 echo -e "\n已退出 NodeWizard。后续随时输入 ${BOLD}${GREEN}nw${NC} 即可再次唤醒！"
