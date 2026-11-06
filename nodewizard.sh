@@ -195,8 +195,8 @@ detect_node_geo() {
 
     SERVER_IP=$(curl -s4 --max-time 4 https://api.ipify.org || curl -s4 --max-time 4 https://ifconfig.me || echo "127.0.0.1")
 
-    # 检测是否有全局公网 IPv6
-    NODE_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | head -n1 | cut -d'/' -f1 || echo "")
+    # 检测是否有全局物理公网 IPv6 (严格过滤 wg*/tun*/tap*/warp*/docker* 等虚拟隧道网卡，防误判 WARP 地址)
+    NODE_IPV6=$(ip -6 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(wg|tun|tap|warp|docker|veth|br-)/ {print $4}' | awk -F'/' 'NR==1{print $1}')
 
     local geo_json status
     geo_json=$(curl -s4 --max-time 4 "http://ip-api.com/json/${SERVER_IP}?fields=status,country,countryCode,city,isp,query" 2>/dev/null || echo "{}")
@@ -568,11 +568,13 @@ net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
+                sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
                 sysctl --system >/dev/null 2>&1 || true
                 IPV6_STRATEGY="1"
                 if [[ -f /usr/local/etc/xray/config.json ]]; then
                     setup_xray_and_warp "silent"
                 fi
+                detect_node_geo
                 msg_ok "系统内核级 IPv6 协议栈已彻底关闭！测试网站绝无泄露可能。"
                 sleep 2
                 ;;
@@ -1024,6 +1026,7 @@ net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
+                sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
                 sysctl --system >/dev/null 2>&1 || true
                 msg_ok "系统内核级已彻底禁用 IPv6 协议栈！任何测试站绝无探测到 IPv6 的可能。"
                 ;;
@@ -1147,7 +1150,7 @@ setup_xray_and_warp() {
     if [[ -z "${IPV6_STRATEGY:-}" ]]; then
         local cur_sys_v6
         cur_sys_v6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
-        if [[ "$cur_sys_v6" == "1" ]]; then
+        if [[ -f /etc/sysctl.d/99-disable-ipv6.conf ]] || [[ "$cur_sys_v6" == "1" ]]; then
             IPV6_STRATEGY="1"
         elif [[ -z "${NODE_IPV6:-}" ]]; then
             IPV6_STRATEGY="2"
@@ -1238,9 +1241,22 @@ EOF
     # 4. 注册 Cloudflare WARP 原生 WireGuard 出站 (含 IPv4 & IPv6 双栈地址)
     local warp_priv="" warp_v4="" warp_v6="" warp_peer_pub="" warp_reserved="[0, 0, 0]"
     local has_warp=false
+    local warp_cache="/usr/local/etc/xray/warp_account.json"
 
-    # 优先复用已有 WARP 凭据
-    if [[ -f /usr/local/etc/xray/config.json ]] && grep -q '"tag": "warp"' /usr/local/etc/xray/config.json 2>/dev/null; then
+    # 优先从本地持久化缓存或已有 config.json 复用 WARP 凭据
+    if [[ -f "$warp_cache" ]]; then
+        warp_priv=$(jq -r '.priv_key // empty' "$warp_cache" 2>/dev/null)
+        warp_v4=$(jq -r '.v4_addr // empty' "$warp_cache" 2>/dev/null)
+        warp_v6=$(jq -r '.v6_addr // empty' "$warp_cache" 2>/dev/null)
+        warp_peer_pub=$(jq -r '.peer_pub // empty' "$warp_cache" 2>/dev/null)
+        warp_reserved=$(jq -c '.reserved // [0,0,0]' "$warp_cache" 2>/dev/null)
+        if [[ -n "$warp_priv" && -n "$warp_v4" ]]; then
+            has_warp=true
+            [[ "$run_mode" != "silent" ]] && msg_ok "成功复用现有 Cloudflare WARP 出站凭据 (IPv4: ${warp_v4})"
+        fi
+    fi
+
+    if [[ "$has_warp" == "false" && -f /usr/local/etc/xray/config.json ]] && grep -q '"tag": "warp"' /usr/local/etc/xray/config.json 2>/dev/null; then
         local w_priv w_v4 w_v6 w_peer w_res
         w_priv=$(jq -r '.outbounds[] | select(.tag=="warp") | .settings.secretKey // empty' /usr/local/etc/xray/config.json 2>/dev/null)
         w_v4=$(jq -r '.outbounds[] | select(.tag=="warp") | .settings.address[0] // empty' /usr/local/etc/xray/config.json 2>/dev/null)
@@ -1254,8 +1270,25 @@ EOF
             warp_peer_pub="$w_peer"
             warp_reserved="${w_res:-[0, 0, 0]}"
             has_warp=true
+            mkdir -p /usr/local/etc/xray
+            cat <<EOF > "$warp_cache"
+{
+  "priv_key": "${warp_priv}",
+  "v4_addr": "${warp_v4}",
+  "v6_addr": "${warp_v6}",
+  "peer_pub": "${warp_peer_pub}",
+  "reserved": ${warp_reserved}
+}
+EOF
+            chown root:xray "$warp_cache" 2>/dev/null || true
+            chmod 640 "$warp_cache" 2>/dev/null || true
             [[ "$run_mode" != "silent" ]] && msg_ok "成功复用现有 Cloudflare WARP 出站凭据 (IPv4: ${warp_v4})"
         fi
+    fi
+
+    # 若选择了策略 3 (WARP IPv6 兜底) 但缓存中无 IPv6 地址，则重新向 Cloudflare 申请双栈凭据
+    if [[ "${IPV6_STRATEGY:-1}" == "3" && -z "$warp_v6" ]]; then
+        has_warp=false
     fi
 
     if [[ "$has_warp" == "false" ]]; then
@@ -1317,6 +1350,10 @@ except Exception as e:
             warp_peer_pub=$(jq -r '.peer_pub' /tmp/warp_creds.json)
             warp_reserved=$(jq -c '.reserved' /tmp/warp_creds.json)
             has_warp=true
+            mkdir -p /usr/local/etc/xray
+            cp -f /tmp/warp_creds.json "$warp_cache" 2>/dev/null || true
+            chown root:xray "$warp_cache" 2>/dev/null || true
+            chmod 640 "$warp_cache" 2>/dev/null || true
             rm -f /tmp/warp_creds.json
             msg_ok "Cloudflare WARP 注册就绪 (内网 IPv4: ${warp_v4})"
         else
@@ -1329,10 +1366,12 @@ except Exception as e:
     local v6_rule_block=""
     local dns_query_strat="UseIPv4"
     local freedom_dom_strat="UseIPv4"
+    local warp_dom_strat="ForceIPv4"
+    local warp_addr_json="\"${warp_v4}\""
 
     case "${IPV6_STRATEGY:-1}" in
         1|2)
-            # 1=系统内核禁用, 2=代理层阻断: 均在 Xray 路由层阻断 ::/0 并锁定 DNS 为 UseIPv4
+            # 1=系统内核禁用, 2=代理层阻断: 均在 Xray 路由层阻断 ::/0 并锁定 DNS 与 WARP 为纯 IPv4
             v6_rule_block=$(cat <<'EOF'
       {
         "type": "field",
@@ -1343,9 +1382,11 @@ EOF
 )
             dns_query_strat="UseIPv4"
             freedom_dom_strat="UseIPv4"
+            warp_dom_strat="ForceIPv4"
+            warp_addr_json="\"${warp_v4}\""
             ;;
         3)
-            # 3=IPv6 走 WARP 兜底 (若 WARP 可用则走 warp，否则阻断防泄露)
+            # 3=IPv6 走 WARP 兜底 (仅在此模式下为 WARP 挂载 IPv6 地址并允许双栈解析)
             local v6_target_tag="block"
             [[ "$has_warp" == "true" ]] && v6_target_tag="warp"
             v6_rule_block=$(cat <<EOF
@@ -1358,19 +1399,20 @@ EOF
 )
             dns_query_strat="UseIP"
             freedom_dom_strat="UseIPv4"
+            warp_dom_strat="ForceIP"
+            if [[ -n "$warp_v6" ]]; then
+                warp_addr_json="\"${warp_v4}\", \"${warp_v6}\""
+            fi
             ;;
         *)
-            # 4=恢复原生双栈直连: 解锁 DNS 与 freedom 出站的 IPv6 能力
+            # 4=恢复原生双栈直连: 解锁 DNS 与 freedom 出站的原生 IPv6 能力 (WARP 保持 IPv4 兜底)
             v6_rule_block=""
             dns_query_strat="UseIP"
             freedom_dom_strat="UseIP"
+            warp_dom_strat="ForceIPv4"
+            warp_addr_json="\"${warp_v4}\""
             ;;
     esac
-
-    local warp_addr_json="\"${warp_v4}\""
-    if [[ -n "$warp_v6" ]]; then
-        warp_addr_json="\"${warp_v4}\", \"${warp_v6}\""
-    fi
 
     # 6. 写入具有三重闭环与 DoH 加密解析的 config.json (适配 Xray v26.10+ 最新规范)
     [[ "$run_mode" != "silent" ]] && msg_info "写入 Xray 生产级配置文件: /usr/local/etc/xray/config.json ..."
@@ -1469,7 +1511,9 @@ EOF
           }
         ],
         "reserved": ${warp_reserved},
-        "mtu": 1280
+        "mtu": 1280,
+        "noKernelTun": true,
+        "domainStrategy": "${warp_dom_strat}"
       },
       "tag": "warp"
     }
@@ -1586,6 +1630,17 @@ EOF
         chmod 640 /var/log/xray/*.log 2>/dev/null || true
         systemctl restart xray
         systemctl enable xray >/dev/null 2>&1
+        # 清理旧版本内核态 WireGuard 遗留的 wg0 虚拟网卡，并在策略 1 下强制锁死内核 disable_ipv6=1
+        ip link delete wg0 2>/dev/null || true
+        if [[ "${IPV6_STRATEGY:-1}" == "1" ]]; then
+            cat <<EOF > /etc/sysctl.d/99-disable-ipv6.conf
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+            sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+            sysctl --system >/dev/null 2>&1 || true
+        fi
         [[ "$run_mode" != "silent" ]] && msg_ok "Xray 核心已成功启动并设置为开机自启！"
     else
         msg_err "Xray 配置文件测试失败，请检查 /usr/local/etc/xray/config.json"
