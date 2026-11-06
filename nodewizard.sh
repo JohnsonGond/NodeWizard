@@ -65,7 +65,7 @@ NODE_FLAG="🇺🇸"
 
 # ── 1. 终端横幅 ─────────────────────────────────────────────────────────────
 print_banner() {
-    clear
+    [[ -t 1 && "${TERM:-dumb}" != "dumb" && "${TERM:-unknown}" != "unknown" ]] && clear 2>/dev/null || true
     echo -e "${CYAN}${BOLD}"
     cat <<'BANNER'
   _   _           _     __        ___                  _ 
@@ -147,7 +147,9 @@ check_environment() {
 
     # 修复 curl ... | bash 管道模式下标准输入被抢占导致 read 跳过的问题
     if [[ ! -t 0 && -e /dev/tty ]]; then
-        exec < /dev/tty
+        if ( : < /dev/tty ) 2>/dev/null; then
+            exec < /dev/tty
+        fi
     fi
 
     # 自动校正 /etc/hosts 缺失本机 hostname 问题 (消除云主机 sudo 5秒延迟与解析报错)
