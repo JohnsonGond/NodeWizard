@@ -38,8 +38,9 @@ msg_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 msg_err()  { echo -e "${RED}[ERR ]${NC} $*"; }
 msg_step() { echo -e "\n${BOLD}${BLUE}==>${NC} ${BOLD}$*${NC}"; }
 
-NW_VERSION="v2.4.0"
-NW_UPDATED="2026-11-06"
+NW_VERSION="v2.5.0"
+NW_UPDATED="2026-11-09"
+XRAY_CLASSIC_VER="v26.7.28"
 DEFAULT_SAFE_USER="safeuser"
 SCRIPT_URL="https://raw.githubusercontent.com/JohnsonGond/NodeWizard/main/nodewizard.sh"
 SHORT_URL="https://nw.531555.xyz"
@@ -51,6 +52,7 @@ MAINT_USER=""
 TARGET_SSH_PORT=""
 OLD_SSH_PORT=""
 IPV6_STRATEGY="1"
+XRAY_CORE_TRACK=""
 REALITY_TARGET=""
 REALITY_SNI=""
 VLESS_UUID=""
@@ -90,6 +92,63 @@ get_remote_version() {
         r_ver=$(curl -fsSL --max-time 3 "$SCRIPT_URL" 2>/dev/null | grep -m1 '^NW_VERSION=' | cut -d'"' -f2 || true)
     fi
     echo "${r_ver:-未知}"
+}
+
+get_installed_xray_ver() {
+    if command -v xray >/dev/null 2>&1; then
+        xray version 2>/dev/null | awk 'NR==1{print $2}' | sed 's/^v//'
+    else
+        echo ""
+    fi
+}
+
+# 判定当前已安装的 Xray 是否强制要求后量子密钥 (X25519MLKEM768, 自 v26.9+ 起强制)
+is_xray_pqc_enforced() {
+    local ver
+    ver=$(get_installed_xray_ver)
+    if [[ -z "$ver" ]]; then
+        [[ "${XRAY_CORE_TRACK:-}" == "classic" ]] && return 1
+        return 0
+    fi
+    local major minor
+    major=$(echo "$ver" | cut -d'.' -f1)
+    minor=$(echo "$ver" | cut -d'.' -f2)
+    if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
+        if (( major > 26 || (major == 26 && minor >= 9) )); then
+            return 0
+        else
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# 内核层禁用 MPTCP (封堵 Linux 内核 MPTCP 提权漏洞，确保 v26.7.28 经典版与 v26.10.31+ 具备同等安全基线)
+ensure_kernel_mptcp_disabled() {
+    if [[ -f /etc/sysctl.d/99-bbr-baseline.conf ]] && ! grep -q '^net\.mptcp\.enabled' /etc/sysctl.d/99-bbr-baseline.conf 2>/dev/null; then
+        echo "net.mptcp.enabled = 0" >> /etc/sysctl.d/99-bbr-baseline.conf
+    elif [[ ! -f /etc/sysctl.d/99-bbr-baseline.conf ]]; then
+        echo "net.mptcp.enabled = 0" > /etc/sysctl.d/99-bbr-baseline.conf
+    fi
+    sysctl -w net.mptcp.enabled=0 >/dev/null 2>&1 || true
+}
+
+install_xray_core_by_track() {
+    local track="${1:-classic}"
+    if ! command -v unzip >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y -qq unzip >/dev/null 2>&1 || true
+    fi
+    ensure_kernel_mptcp_disabled
+    if [[ "$track" == "classic" ]]; then
+        msg_info "正在部署 Xray-core 【中转稳连经典版 ${XRAY_CLASSIC_VER}】(单包 X25519 握手，防跨境分片丢包)..."
+        bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "${XRAY_CLASSIC_VER}" >/dev/null 2>&1
+    else
+        msg_info "正在部署 Xray-core 【最新后量子加密版 latest】(强制 X25519MLKEM768)..."
+        bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
+    fi
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 || true
 }
 
 # ── 2. 运行权限校验、快捷命令安装与自动更新 ─────────────────────────────────
@@ -373,13 +432,27 @@ audit_node_status() {
         echo -e "  系统内核 IPv6 开关: ${BOLD}${GREEN}正常启用 (内核协议栈活跃)${NC}"
     fi
 
+    local mptcp_en
+    mptcp_en=$(sysctl -n net.mptcp.enabled 2>/dev/null || echo "0")
+    if [[ "$mptcp_en" == "0" ]]; then
+        echo -e "  内核 MPTCP 状态   : ${BOLD}${GREEN}已禁用 (net.mptcp.enabled=0，已封堵内核 MPTCP 漏洞)${NC}"
+    else
+        echo -e "  内核 MPTCP 状态   : ${YELLOW}启用中 (建议通过 [7] 升级加固为禁用)${NC}"
+    fi
+
     # 5. Xray 代理核心与分流矩阵
     echo -e "\n${BOLD}${BLUE}5. Xray 代理核心与深度分流矩阵${NC}"
     if systemctl is-active xray >/dev/null 2>&1; then
-        local svc_user
+        local svc_user cur_xv
         svc_user=$(systemctl show -p User --value xray 2>/dev/null || echo "root")
         [[ -z "$svc_user" ]] && svc_user="root"
-        echo -e "  Xray 服务状态     : ${BOLD}${GREEN}运行中 (Active)${NC} (版本: $(xray version 2>/dev/null | awk 'NR==1{print $2}') / 运行账户: ${svc_user})"
+        cur_xv=$(get_installed_xray_ver)
+        echo -e "  Xray 服务状态     : ${BOLD}${GREEN}运行中 (Active)${NC} (版本: ${cur_xv} / 运行账户: ${svc_user})"
+        if is_xray_pqc_enforced; then
+            echo -e "  握手加密轨道      : ${BOLD}${YELLOW}🚀 后量子强制轨道 (X25519MLKEM768 | 首包 ~1.8KB 双分片 | 适合直连)${NC}"
+        else
+            echo -e "  握手加密轨道      : ${BOLD}${GREEN}🛡️ 中转稳连经典轨道 (X25519 | 首包 ~500B 单包 | 跨中转防断流)${NC}"
+        fi
         if [[ -f /usr/local/etc/xray/config.json ]]; then
             local curr_sni curr_uuid min_ver
             curr_sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // "未知"' /usr/local/etc/xray/config.json 2>/dev/null)
@@ -470,6 +543,17 @@ view_client_configs() {
 
     local default_node_title="${NODE_FLAG} ${NODE_CITY} 落地"
     local encoded_city="${NODE_CITY// /%20}"
+    local cur_xv pqc_yaml_line="" pqc_uri_param="" track_desc=""
+    cur_xv=$(get_installed_xray_ver)
+    if is_xray_pqc_enforced; then
+        pqc_yaml_line=$'\n      support-x25519mlkem768: true'
+        pqc_uri_param="&support-x25519mlkem768=true"
+        track_desc="${YELLOW}🚀 后量子强制轨道 (v${cur_xv} | 强制 X25519MLKEM768)${NC}"
+    else
+        pqc_yaml_line=""
+        pqc_uri_param=""
+        track_desc="${GREEN}🛡️ 中转稳连经典轨道 (v${cur_xv} | 单包 X25519 握手)${NC}"
+    fi
 
     echo ""
     echo "=========================================================================="
@@ -477,6 +561,7 @@ view_client_configs() {
     echo "=========================================================================="
     echo -e "  节点地理标识      : ${BOLD}${NODE_FLAG} ${NODE_COUNTRY} - ${NODE_CITY}${NC} (${NODE_ISP})"
     echo -e "  公网 IP 地址      : ${BOLD}${CYAN}${SERVER_IP}${NC}"
+    echo -e "  Xray 核心与轨道   : ${BOLD}${track_desc}"
     echo -e "  VLESS 监听端口    : ${BOLD}${port} (TCP)${NC}"
     echo -e "  Reality 伪装源站  : ${BOLD}${target}${NC} (SNI: ${sni})"
     echo -e "  Reality PublicKey : ${BOLD}${GREEN}${pub_key}${NC}"
@@ -484,6 +569,18 @@ view_client_configs() {
     echo -e "  VLESS UUID        : ${BOLD}${uuid}${NC}"
     echo -e "  Client Fingerprint: ${BOLD}chrome${NC}"
     echo "=========================================================================="
+
+    if is_xray_pqc_enforced; then
+        echo -e "\n${BOLD}${YELLOW}⚠️ 【跨境中转分片断流预警 (X25519MLKEM768)】${NC}"
+        echo -e "  1. 当前服务端 (v${cur_xv}) 强制要求后量子握手，下方配置已自动附带 ${CYAN}support-x25519mlkem768: true${NC}。"
+        echo -e "  2. 后量子密钥会使客户端发出的 TLS ClientHello 膨胀至 ~1.8KB (拆分为 2 个 TCP 分片)。"
+        echo -e "     ${YELLOW}若配合跨境四层中转 (如 nftables 转发) 出现偶发 connection closed，请运行 ${BOLD}${GREEN}nw${NC}${YELLOW} -> ${BOLD}[7]${NC}${YELLOW} -> ${BOLD}[1]${NC}${YELLOW} 一键切换至 ${XRAY_CLASSIC_VER} 经典单包版！${NC}"
+    else
+        echo -e "\n${BOLD}${GREEN}🛡️ 【中转稳连经典模式提示 (单包 X25519 握手)】${NC}"
+        echo -e "  1. 当前服务端运行于 ${BOLD}${GREEN}v${cur_xv}${NC} 经典轨道，下方配置与链接已${BOLD}自动剔除${NC}后量子参数。"
+        echo -e "  2. ${BOLD}${YELLOW}重要：若您在 Sub-Store 或客户端中托管此节点，请务必关闭/移除该节点的 support-x25519mlkem768: true！${NC}"
+        echo -e "     只有客户端关闭该项，发往中转机的 ClientHello 才会回落至 ~500B 单包，彻底杜绝跨境分片并发流控丢包 (connection closed)。"
+    fi
 
     echo -e "\n${BOLD}${BLUE}【1. Clash Meta (Mihomo) / Clash Verge 客户端配置块】${NC}"
     echo -e "${YELLOW}直接复制以下内容粘贴至你的 Clash 配置文件 proxies: 列表下：${NC}\n"
@@ -503,8 +600,7 @@ proxies:
     servername: ${sni}
     reality-opts:
       public-key: ${pub_key}
-      short-id: ${short_id}
-      support-x25519mlkem768: true
+      short-id: ${short_id}${pqc_yaml_line}
     client-fingerprint: chrome
 
   # ================= 模式 2: 链式中继落地模式 =================
@@ -520,17 +616,16 @@ proxies:
     servername: ${sni}
     reality-opts:
       public-key: ${pub_key}
-      short-id: ${short_id}
-      support-x25519mlkem768: true
+      short-id: ${short_id}${pqc_yaml_line}
     client-fingerprint: chrome
     dialer-proxy: "机场-低延迟节点名称"   # <-- 替换为您已有中转/机场订阅中的节点名称
 EOF
 
-    echo -e "\n${BOLD}${BLUE}【2. Sub-Store / Shadowrocket / 通用一键导入链接 (含后量子参数)】${NC}"
+    echo -e "\n${BOLD}${BLUE}【2. Sub-Store / Shadowrocket / 通用一键导入链接】${NC}"
     echo -e "* 直连模式："
-    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&support-x25519mlkem768=true&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
+    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}${pqc_uri_param}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
     echo -e "* 链式中继落地模式："
-    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&support-x25519mlkem768=true&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
+    echo -e "${CYAN}vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}${pqc_uri_param}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
 
     echo ""
     echo "=========================================================================="
@@ -651,7 +746,7 @@ install_dependencies() {
     msg_step "【Step 1/7】更新软件源并安装基础运行工具链"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq curl wget jq openssl iproute2 python3 ca-certificates \
+    apt-get install -y -qq curl wget jq unzip openssl iproute2 python3 ca-certificates \
         ufw fail2ban procps dnsutils sudo logrotate unattended-upgrades >/dev/null 2>&1
     msg_ok "基础运行环境就绪"
 }
@@ -974,8 +1069,8 @@ setup_system_base_and_tcpfit() {
         msg_ok "系统已有足够 Swap (${total_swap_kb} kB)"
     fi
 
-    # 2. 原生 BBR + FQ 保底生效 (0.5秒即时生效)
-    msg_info "启用内核原生 BBR + FQ 拥塞控制基线..."
+    # 2. 原生 BBR + FQ 保底生效与内核 MPTCP 漏洞封堵 (0.5秒即时生效)
+    msg_info "启用内核原生 BBR + FQ 拥塞控制基线并锁定禁用内核 MPTCP..."
     modprobe tcp_bbr 2>/dev/null || true
     modprobe sch_fq 2>/dev/null || true
     cat <<EOF > /etc/sysctl.d/99-bbr-baseline.conf
@@ -985,9 +1080,10 @@ net.ipv4.tcp_congestion_control = bbr
 fs.file-max = 1048576
 net.core.somaxconn = 65535
 net.ipv4.tcp_tw_reuse = 1
+net.mptcp.enabled = 0
 EOF
     sysctl --system >/dev/null 2>&1 || true
-    msg_ok "内核原生 BBR + FQ 基础调优已生效"
+    msg_ok "内核原生 BBR + FQ 基础调优与 MPTCP 漏洞封堵已生效"
 
     # 3. Google 权威 DNS
     msg_info "配置系统 DNS 解析器至 Google DNS (8.8.8.8 / 8.8.4.4)..."
@@ -1184,12 +1280,39 @@ setup_xray_and_warp() {
         fi
     fi
 
-    # 1. 安装 Xray 官方最新核心
-    if ! command -v xray >/dev/null 2>&1; then
-        msg_info "正在通过官方安装脚本部署最新 Xray-core..."
-        bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
+    # 1. 选择并安装 Xray 核心轨道 (双轨制: 中转稳连经典版 v26.7.28 vs 最新后量子版 latest)
+    ensure_kernel_mptcp_disabled
+    if [[ "$run_mode" == "interactive" ]]; then
+        local cur_xv def_track="1"
+        cur_xv=$(get_installed_xray_ver)
+        if [[ -n "$cur_xv" ]] && is_xray_pqc_enforced; then
+            def_track="1"
+        fi
+        echo ""
+        echo -e "请选择要部署的 ${BOLD}${CYAN}Xray-core 内核版本轨道${NC} (随时可通过 ${GREEN}nw${NC} -> ${BOLD}[7]${NC} 自由无损切换)："
+        echo -e "  ${BOLD}[1]${NC} ${GREEN}🛡️ 中转稳连经典版 (${XRAY_CLASSIC_VER}) [强烈推荐搭配中转机 / nftables 转发 / 链式代理]${NC}"
+        echo -e "      * 特性: 强制后量子前最后一个官方正式版，TLS ClientHello 保持 ~500B 单包发送"
+        echo -e "      * 优势: 彻底规避跨境线路因 mlkem768 握手包膨胀(~1.8KB 双分片)引发的并发流控丢包与 connection closed"
+        echo -e "      * 安全: 已自动叠加 Linux 内核层 MPTCP 禁用补丁 (net.mptcp.enabled=0)，安全基线与新版对齐"
+        echo -e "  ${BOLD}[2]${NC} ${YELLOW}🚀 最新后量子加密版 (latest) [适合纯直连或无需过跨境四层中转的场景]${NC}"
+        echo -e "      * 特性: 强制启用 X25519MLKEM768 后量子混合密钥交换"
+        echo -e "      * 预警: 客户端发出的 ClientHello 膨胀至 ~1.8KB (拆分为 2 个 TCP 分片)，经部分跨境中转易触发断流"
+        if [[ -n "$cur_xv" ]]; then
+            echo -e "  ${CYAN}(当前已安装版本: v${cur_xv})${NC}"
+        fi
+        echo ""
+        read -rp "请选择 Xray 内核轨道 [1-2] (默认 ${def_track}): " track_choice
+        track_choice=${track_choice:-$def_track}
+        if [[ "$track_choice" == "2" ]]; then
+            XRAY_CORE_TRACK="latest"
+        else
+            XRAY_CORE_TRACK="classic"
+        fi
+        install_xray_core_by_track "$XRAY_CORE_TRACK"
+    elif ! command -v xray >/dev/null 2>&1; then
+        install_xray_core_by_track "${XRAY_CORE_TRACK:-classic}"
     fi
-    [[ "$run_mode" != "silent" ]] && msg_ok "Xray 核心已就绪 ($(xray version 2>/dev/null | awk 'NR==1{print $2}'))"
+    [[ "$run_mode" != "silent" ]] && msg_ok "Xray 核心已就绪 (v$(get_installed_xray_ver))"
 
     # 2. 创建系统级专用服务账户 xray:xray 并配置 Linux Capabilities 特权绑定
     getent group xray >/dev/null 2>&1 || groupadd -r xray 2>/dev/null || true
@@ -1717,6 +1840,17 @@ generate_client_configs() {
 
     local default_node_title="${NODE_FLAG} ${NODE_CITY} 落地"
     local encoded_city="${NODE_CITY// /%20}"
+    local cur_xv pqc_yaml_line="" pqc_uri_param="" track_desc=""
+    cur_xv=$(get_installed_xray_ver)
+    if is_xray_pqc_enforced; then
+        pqc_yaml_line=$'\n      support-x25519mlkem768: true'
+        pqc_uri_param="&support-x25519mlkem768=true"
+        track_desc="${YELLOW}🚀 后量子强制轨道 (v${cur_xv} | 强制 X25519MLKEM768)${NC}"
+    else
+        pqc_yaml_line=""
+        pqc_uri_param=""
+        track_desc="${GREEN}🛡️ 中转稳连经典轨道 (v${cur_xv} | 单包 X25519 握手)${NC}"
+    fi
 
     echo ""
     read -rp "请输入为此节点绑定的【直连域名】 (如 us-2-dir.yourdomain.com，直接回车使用公网 IP): " input_dir_dom
@@ -1732,6 +1866,7 @@ generate_client_configs() {
     echo -e "  节点地理标识      : ${BOLD}${NODE_FLAG} ${NODE_COUNTRY} - ${NODE_CITY}${NC} (${NODE_ISP})"
     echo -e "  公网 IP 地址      : ${BOLD}${CYAN}${SERVER_IP}${NC}"
     echo -e "  SSH 登录端口      : ${BOLD}${YELLOW}${TARGET_SSH_PORT}${NC} (运维用户: ${MAINT_USER} / 仅密钥登录)"
+    echo -e "  Xray 核心与轨道   : ${BOLD}${track_desc}"
     echo -e "  VLESS 监听端口    : ${BOLD}443 (TCP)${NC}"
     echo -e "  Reality 伪装源站  : ${BOLD}${REALITY_TARGET}${NC} (SNI: ${REALITY_SNI})"
     echo -e "  Reality PublicKey : ${BOLD}${GREEN}${REALITY_PUB_KEY}${NC}"
@@ -1739,8 +1874,20 @@ generate_client_configs() {
     echo -e "  VLESS UUID        : ${BOLD}${VLESS_UUID}${NC}"
     echo -e "  Client Fingerprint: ${BOLD}chrome${NC}"
     echo -e "  全局快捷启动命令  : ${BOLD}${GREEN}nw${NC} 或 ${BOLD}${GREEN}nodewiz${NC} (随时呼出管理面板)"
-    echo -e "  核心安全防线      : ${BOLD}UFW 白名单 / Fail2ban / Geolocation黑洞 / WARP兜底 / BBR${NC}"
+    echo -e "  核心安全防线      : ${BOLD}UFW 白名单 / Fail2ban / Geolocation黑洞 / WARP兜底 / BBR / MPTCP封堵${NC}"
     echo "=========================================================================="
+
+    if is_xray_pqc_enforced; then
+        echo -e "\n${BOLD}${YELLOW}⚠️ 【跨境中转分片断流预警 (X25519MLKEM768)】${NC}"
+        echo -e "  1. 当前服务端 (v${cur_xv}) 强制要求后量子握手，下方配置已自动附带 ${CYAN}support-x25519mlkem768: true${NC}。"
+        echo -e "  2. 后量子密钥会使客户端发出的 TLS ClientHello 膨胀至 ~1.8KB (拆分为 2 个 TCP 分片)。"
+        echo -e "     ${YELLOW}若配合跨境四层中转 (如 nftables 转发) 出现偶发 connection closed，请运行 ${BOLD}${GREEN}nw${NC}${YELLOW} -> ${BOLD}[7]${NC}${YELLOW} -> ${BOLD}[1]${NC}${YELLOW} 一键切换至 ${XRAY_CLASSIC_VER} 经典单包版！${NC}"
+    else
+        echo -e "\n${BOLD}${GREEN}🛡️ 【中转稳连经典模式提示 (单包 X25519 握手)】${NC}"
+        echo -e "  1. 当前服务端运行于 ${BOLD}${GREEN}v${cur_xv}${NC} 经典轨道，下方配置与链接已${BOLD}自动剔除${NC}后量子参数。"
+        echo -e "  2. ${BOLD}${YELLOW}重要：若您在 Sub-Store 或客户端中托管此节点，请务必关闭/移除该节点的 support-x25519mlkem768: true！${NC}"
+        echo -e "     只有客户端关闭该项，发往中转机的 ClientHello 才会回落至 ~500B 单包，彻底杜绝跨境分片并发流控丢包 (connection closed)。"
+    fi
 
     echo -e "\n${BOLD}${BLUE}【1. Clash Meta (Mihomo) / Clash Verge 客户端配置块】${NC}"
     echo -e "${YELLOW}直接复制以下内容粘贴至你的 Clash 配置文件 proxies: 列表下：${NC}\n"
@@ -1760,8 +1907,7 @@ proxies:
     servername: ${REALITY_SNI}
     reality-opts:
       public-key: ${REALITY_PUB_KEY}
-      short-id: ${REALITY_SHORT_ID}
-      support-x25519mlkem768: true
+      short-id: ${REALITY_SHORT_ID}${pqc_yaml_line}
     client-fingerprint: chrome
 
   # ================= 模式 2: 链式中继模式 (通过专用中继子域名 + XUDP 防泄露) =================
@@ -1777,17 +1923,16 @@ proxies:
     servername: ${REALITY_SNI}
     reality-opts:
       public-key: ${REALITY_PUB_KEY}
-      short-id: ${REALITY_SHORT_ID}
-      support-x25519mlkem768: true
+      short-id: ${REALITY_SHORT_ID}${pqc_yaml_line}
     client-fingerprint: chrome
     dialer-proxy: "机场-低延迟节点名称"   # <-- 替换为您已有中转/机场订阅中的节点名称
 EOF
 
-    echo -e "\n${BOLD}${BLUE}【2. Sub-Store / Shadowrocket / 通用一键导入链接 (含后量子参数)】${NC}"
+    echo -e "\n${BOLD}${BLUE}【2. Sub-Store / Shadowrocket / 通用一键导入链接】${NC}"
     echo -e "* 直连模式："
-    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_dir}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&support-x25519mlkem768=true&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
+    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_dir}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}${pqc_uri_param}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E7%9B%B4%E8%BF%9E${NC}"
     echo -e "* 链式中继落地模式："
-    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_rly}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}&support-x25519mlkem768=true&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
+    echo -e "${CYAN}vless://${VLESS_UUID}@${domain_rly}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB_KEY}&sid=${REALITY_SHORT_ID}${pqc_uri_param}&type=tcp&headerType=none#${NODE_FLAG}%20${encoded_city}%E4%B8%AD%E7%BB%A7%E8%90%BD%E5%9C%B0${NC}"
 
     echo -e "\n=========================================================================="
     echo -e "                   ${BOLD}${RED}⚠️  新机上线后必做的 3 项外部核验 ⚠️${NC}"
@@ -1810,29 +1955,51 @@ EOF
 # ── 19. 核心与依赖热升级及维护中心 (菜单选项 [7]) ────────────────────────────
 upgrade_xray_core_and_migrate() {
     local call_mode="${1:-menu}"
+    local target_track="${2:-}"
     print_banner
-    msg_step "【核心与依赖热升级】正在升级系统基础依赖、Xray-core、Geo 规则库与配置规范..."
 
-    # 1. 更新系统关键基础依赖
-    msg_info "1/4 正在同步 apt 软件源并更新基础组件 (curl, jq, openssl, ca-certificates, logrotate)..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y -qq >/dev/null 2>&1 || true
-    apt-get install -y -qq curl wget jq openssl ca-certificates logrotate python3 >/dev/null 2>&1 || true
-    msg_ok "系统关键基础依赖已更新至最新状态"
-
-    # 2. 升级 Xray-core 与 GeoIP/GeoSite 路由规则库
     local old_xray_ver="未安装"
     if command -v xray >/dev/null 2>&1; then
-        old_xray_ver=$(xray version 2>/dev/null | awk 'NR==1{print $2}')
+        old_xray_ver=$(get_installed_xray_ver)
         [[ -z "$old_xray_ver" ]] && old_xray_ver="未知"
     fi
-    msg_info "2/4 正在拉取官方最新 Xray-core 及 GeoIP/GeoSite 路由数据库 (当前版本: ${old_xray_ver})..."
-    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
-    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 || true
+
+    if [[ -z "$target_track" ]]; then
+        echo -e "${BOLD}${CYAN}🔄【Xray 核心双轨切换与热升级向导】${NC} (当前已安装版本: ${BOLD}${GREEN}${old_xray_ver}${NC})\n"
+        echo -e "请选择目标 Xray-core 内核轨道："
+        echo -e "  ${BOLD}[1]${NC} ${GREEN}🛡️ 中转稳连经典版 (${XRAY_CLASSIC_VER}) [解决跨中转 connection closed 断流首选]${NC}"
+        echo -e "      * 强制后量子前最后一个官方正式版，TLS ClientHello 保持 ~500B 单包发送"
+        echo -e "      * 彻底规避跨境四层中转 (如 nftables) 因 mlkem768 握手分片引发的并发流控丢包"
+        echo -e "  ${BOLD}[2]${NC} ${YELLOW}🚀 最新后量子加密版 (latest) [强制 X25519MLKEM768，适合纯直连节点]${NC}"
+        echo -e "      * 跟进官方最新 Release，客户端需开启 support-x25519mlkem768: true"
+        echo ""
+        read -rp "请选择要切换/升级的目标轨道 [1-2] (默认 1): " up_track_opt
+        up_track_opt=${up_track_opt:-1}
+        if [[ "$up_track_opt" == "2" ]]; then
+            target_track="latest"
+        else
+            target_track="classic"
+        fi
+    fi
+
+    XRAY_CORE_TRACK="$target_track"
+    msg_step "【核心与依赖热升级】正在同步系统依赖、切换 Xray 核心轨道 (${target_track})、更新 Geo 规则库与配置规范..."
+
+    # 1. 更新系统关键基础依赖与内核 MPTCP 漏洞封堵
+    msg_info "1/4 正在同步 apt 软件源、更新基础组件并加固内核 MPTCP 安全基线..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq curl wget jq unzip openssl ca-certificates logrotate python3 >/dev/null 2>&1 || true
+    ensure_kernel_mptcp_disabled
+    msg_ok "系统关键基础依赖与内核 MPTCP 封堵 (net.mptcp.enabled=0) 已就绪"
+
+    # 2. 按选定轨道安装/切换 Xray-core 与最新 GeoIP/GeoSite 路由规则库
+    msg_info "2/4 正在安装/切换 Xray-core 并同步最新 GeoIP/GeoSite 路由数据库 (原版本: ${old_xray_ver})..."
+    install_xray_core_by_track "$target_track"
     local new_xray_ver
-    new_xray_ver=$(xray version 2>/dev/null | awk 'NR==1{print $2}')
+    new_xray_ver=$(get_installed_xray_ver)
     [[ -z "$new_xray_ver" ]] && new_xray_ver="未知"
-    msg_ok "Xray-core 及 Geo 路由库已升级完成: ${BOLD}${YELLOW}${old_xray_ver}${NC} -> ${BOLD}${GREEN}${new_xray_ver}${NC}"
+    msg_ok "Xray-core 及 Geo 路由库已就绪: ${BOLD}${YELLOW}${old_xray_ver}${NC} -> ${BOLD}${GREEN}${new_xray_ver}${NC}"
 
     # 3. 同步更新 tcpfit 工具
     msg_info "3/4 正在同步最新版 tcpfit 网络调优工具..."
@@ -1842,16 +2009,23 @@ upgrade_xray_core_and_migrate() {
 
     # 4. 无损迁移现有 Xray 配置规范 (保留 UUID/Reality密钥/SNI/WARP/IPv6策略)
     if [[ -f /usr/local/etc/xray/config.json ]]; then
-        msg_info "4/4 正在将现有 Xray 配置文件无损迁移至最新规范 (补齐 minClientVer / User=xray / sockopt)..."
+        msg_info "4/4 正在将现有 Xray 配置文件无损迁移至最新规范 (User=xray / noKernelTun / minClientVer / sockopt)..."
         IPV6_STRATEGY="" REALITY_TARGET="" REALITY_SNI="" setup_xray_and_warp "migrate"
         echo ""
         echo "=========================================================================="
-        echo -e "  ${BOLD}${GREEN}🎉 老节点热升级与配置迁移全部完成！${NC}"
+        echo -e "  ${BOLD}${GREEN}🎉 节点核心轨道切换与无损配置迁移全部完成！${NC}"
         echo "=========================================================================="
         echo -e "  * Xray 核心版本 : ${BOLD}${old_xray_ver}${NC} -> ${BOLD}${GREEN}${new_xray_ver}${NC}"
         echo -e "  * 凭据保留状态  : ${BOLD}${GREEN}原有 UUID、Reality 密钥、伪装源站、WARP 凭据、IPv6 策略 100% 原样保留${NC}"
-        echo -e "  * 权限与配置加固: ${BOLD}${CYAN}已切换至 User=xray、补齐 minClientVer: 0.0.0、迁移 sockopt.domainStrategy${NC}"
-        echo -e "  * 客户端小贴士  : 可随时输入 ${BOLD}${GREEN}nw link${NC} 获取含 ${CYAN}support-x25519mlkem768: true${NC} 的最新客户端配置块"
+        echo -e "  * 权限与安全加固: ${BOLD}${CYAN}User=xray、用户态 WARP (防篡改内核 IPv6)、内核禁用 MPTCP (net.mptcp.enabled=0)${NC}"
+        if is_xray_pqc_enforced; then
+            echo -e "  * ${BOLD}${YELLOW}⚠️ 客户端配置提醒 (后量子强制轨道):${NC}"
+            echo -e "    请确保 Sub-Store 或客户端已为该节点开启 ${CYAN}support-x25519mlkem768: true${NC} (可输入 ${GREEN}nw link${NC} 提取最新链接)。"
+        else
+            echo -e "  * ${BOLD}${GREEN}🛡️ 客户端防断流关键操作 (中转稳连经典轨道 v${new_xray_ver}):${NC}"
+            echo -e "    ${YELLOW}请务必在 Sub-Store 或客户端中【关闭/移除】该节点的 support-x25519mlkem768: true！${NC}"
+            echo -e "    (也可直接输入 ${BOLD}${GREEN}nw link${NC} 复制已自动剔除后量子参数的最新纯净链接，使握手包回落至 ~500B 单包)"
+        fi
         echo "=========================================================================="
     else
         msg_warn "当前节点尚未部署 /usr/local/etc/xray/config.json，仅完成了 Xray 二进制核心与依赖预装。"
@@ -1865,10 +2039,15 @@ upgrade_xray_core_and_migrate() {
 manage_update_menu() {
     while true; do
         print_banner
-        local cur_xver="未安装"
+        local cur_xver="未安装" track_badge=""
         if command -v xray >/dev/null 2>&1; then
-            cur_xver=$(xray version 2>/dev/null | awk 'NR==1{print $2}')
+            cur_xver=$(get_installed_xray_ver)
             [[ -z "$cur_xver" ]] && cur_xver="未知"
+            if is_xray_pqc_enforced; then
+                track_badge="${YELLOW}[🚀 后量子强制轨道 · 强制 mlkem768 | 跨中转易分片断流]${NC}"
+            else
+                track_badge="${GREEN}[🛡️ 中转稳连经典轨道 · 单包 X25519 | 跨中转防断流 ✅]${NC}"
+            fi
         fi
         local remote_ver ver_badge
         remote_ver=$(get_remote_version)
@@ -1879,27 +2058,32 @@ manage_update_menu() {
         else
             ver_badge="${YELLOW}${BOLD}(发现云端新版本: ${remote_ver} 🔔 建议更新)${NC}"
         fi
-        echo -e "${BOLD}${CYAN}🔄【更新与维护中心 (Core & GeoData & Config Migration)】${NC}\n"
+        echo -e "${BOLD}${CYAN}🔄【更新与维护中心 (双轨核心切换 & 规则库升级 & 配置无损迁移)】${NC}\n"
         echo -e "  * 当前脚本版本       : ${BOLD}${GREEN}${NW_VERSION}${NC} (${NW_UPDATED}) ${ver_badge}"
-        echo -e "  * 当前 Xray 核心版本 : ${BOLD}${GREEN}${cur_xver}${NC}"
+        echo -e "  * 当前 Xray 核心版本 : ${BOLD}${GREEN}${cur_xver}${NC} ${track_badge}"
         echo -e "  * 快捷命令安装路径   : ${BOLD}${INSTALL_PATH}${NC} (别名: ${ALIAS_PATH})\n"
+        echo -e "${YELLOW}💡 提示: 若节点配合跨境四层中转 (如 nftables) 出现偶发 connection closed，请选择 [1] 切换至 ${XRAY_CLASSIC_VER} 经典单包版。${NC}\n"
         echo -e "请选择维护操作："
-        echo -e "  ${BOLD}[1]${NC} ${GREEN}⚡ 升级 Xray 核心、Geo 规则库与依赖 + 无损迁移最新配置规范 (推荐老机器执行)${NC}"
-        echo -e "  ${BOLD}[2]${NC} ${CYAN}📜 仅在线更新 NodeWizard 脚本自身 (从云端拉取最新 nw 脚本)${NC}"
-        echo -e "  ${BOLD}[3]${NC} ${YELLOW}🚀 全量一条龙更新 (先同步最新 NodeWizard 脚本，再自动升级 Xray 核心与配置)${NC}"
+        echo -e "  ${BOLD}[1]${NC} ${GREEN}🛡️ 切换/锁定至【中转稳连经典版 ${XRAY_CLASSIC_VER}】+ 更新 Geo 规则库与配置规范 (中转防断流强烈推荐)${NC}"
+        echo -e "  ${BOLD}[2]${NC} ${YELLOW}⚡ 升级至【最新后量子加密版 latest】+ 更新 Geo 规则库与配置规范 (适合纯直连节点)${NC}"
+        echo -e "  ${BOLD}[3]${NC} ${CYAN}📜 仅在线更新 NodeWizard 脚本自身 (从云端拉取最新 nw 脚本)${NC}"
+        echo -e "  ${BOLD}[4]${NC} ${MAGENTA}🚀 全量一条龙更新 (先同步最新 NodeWizard 脚本，再选择核心轨道并迁移配置)${NC}"
         echo -e "  ${BOLD}[0]${NC} 返回上级主菜单"
         echo "=========================================================================="
-        read -rp "请输入选项编号 [0-3] (默认 1): " up_choice
+        read -rp "请输入选项编号 [0-4] (默认 1): " up_choice
         up_choice=${up_choice:-1}
 
         case "$up_choice" in
             1)
-                upgrade_xray_core_and_migrate "menu"
+                upgrade_xray_core_and_migrate "menu" "classic"
                 ;;
             2)
-                update_script
+                upgrade_xray_core_and_migrate "menu" "latest"
                 ;;
             3)
+                update_script
+                ;;
+            4)
                 update_script "upgrade"
                 ;;
             0)
@@ -1956,8 +2140,10 @@ main() {
         echo -e "${BOLD}${CYAN}NodeWizard (${NW_VERSION}) 快捷命令行用法:${NC}"
         echo -e "  ${GREEN}nw${NC} / ${GREEN}nodewiz${NC}          启动交互式主菜单"
         echo -e "  ${GREEN}nw status${NC}             直接查看当前节点配置巡检看板"
-        echo -e "  ${GREEN}nw link${NC}               直接提取 Clash Meta / Shadowrocket 节点订阅链接"
-        echo -e "  ${GREEN}nw upgrade${NC}            升级 Xray 核心、Geo 规则库并无损迁移最新配置规范"
+        echo -e "  ${GREEN}nw link${NC}               直接提取版本自适应的 Clash Meta / VLESS 节点链接"
+        echo -e "  ${GREEN}nw upgrade${NC}            交互式切换/升级 Xray 核心轨道 (${XRAY_CLASSIC_VER} 经典版 / latest) 并迁移配置"
+        echo -e "  ${GREEN}nw upgrade classic${NC}    一键切换至 ${XRAY_CLASSIC_VER} 中转稳连经典版 (单包握手防断流)"
+        echo -e "  ${GREEN}nw upgrade latest${NC}     一键升级至最新后量子加密版 (强制 X25519MLKEM768)"
         echo -e "  ${GREEN}nw update${NC}             从云端同步更新最新版本的 NodeWizard 脚本"
         echo -e "  ${GREEN}nw -v${NC}                 查看本地与云端最新脚本版本号"
         exit 0
@@ -1970,7 +2156,7 @@ main() {
 
     detect_node_geo
 
-    # 支持命令行快捷参数: nw status | nw link | nw upgrade
+    # 支持命令行快捷参数: nw status | nw link | nw upgrade [classic|latest]
     case "${1:-}" in
         status|check|-s)
             audit_node_status "cli"
@@ -1981,7 +2167,13 @@ main() {
             exit 0
             ;;
         upgrade|-U)
-            upgrade_xray_core_and_migrate "cli"
+            local cli_track=""
+            if [[ "${2:-}" =~ ^(classic|26\.7\.28|v26\.7\.28)$ ]]; then
+                cli_track="classic"
+            elif [[ "${2:-}" =~ ^(latest|pqc)$ ]]; then
+                cli_track="latest"
+            fi
+            upgrade_xray_core_and_migrate "cli" "$cli_track"
             exit 0
             ;;
     esac
